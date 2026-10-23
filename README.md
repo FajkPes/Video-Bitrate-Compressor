@@ -1,62 +1,52 @@
-# Video Bitrate Compressor
+> **Current application: Video Bitrate Compressor 1.4**, published 2026-10-23. Download the portable Windows ZIP from Releases, unpack it completely and run `VideoBitrateCompressor.exe`. Full FFmpeg/FFprobe 8.1.2 are in `tools/`; all three programs must remain together. Personal settings, job/project state, benchmark videos and old backups are excluded.
 
-A practical Windows batch encoder that compresses every video to a percentage of **its own source bitrate**. It was created to shrink mixed collections consistently—for example, reducing many videos to roughly 50% without calculating a different target bitrate for every file.
+# Video Bitrate Compressor 1.4
 
-## Highlights
+Spouštěj `VideoBitrateCompressor.exe` nebo `Kompresor videa.bat`. Aplikace obsahuje vlastní běhové prostředí a při tomto způsobu spuštění nepotřebuje systémový Python.
 
-- Percentage, fixed-bitrate, and bitrate-cap modes
-- Batch queue, folders, individual files, drag and drop, and optional recursion
-- HEVC/H.265, H.264, and AV1 options through NVIDIA, Intel, AMD, or CPU encoders
-- Resolution, frame-rate, rotation, deinterlacing, denoise, rate-control, and advanced FFmpeg controls
-- Audio passthrough or re-encoding, multiple audio tracks, channel/sample-rate controls, timing offset, and EBU R128 loudness normalization
-- MP4, MKV, MOV, and source-container output
-- Pause, safe stop, playable partial-file option, collision handling, and source-overwrite protection
-- English by default with optional Czech available inside the app
+## Windows: řízený přístup ke složkám
 
-## Download and run
+V Zabezpečení Windows → Ochrana před viry a hrozbami → Spravovat ochranu před ransomwarem → Povolit aplikaci prostřednictvím řízeného přístupu ke složkám povol konkrétní soubory:
 
-1. Open the [latest release](https://github.com/FajkPes/Video-Bitrate-Compressor/releases/latest).
-2. Download `Video-Bitrate-Compressor-v1.2.0-Windows-x64.zip`.
-3. Extract the **entire ZIP** to a normal folder.
-4. Double-click `Start Video Bitrate Compressor.bat` or `VideoBitrateCompressor.exe`.
+- `VideoBitrateCompressor.exe` z této složky (nastavení a projekty).
+- `tools/ffmpeg.exe` z této složky (zápis komprimovaného videa).
 
-The complete release includes the app runtime, FFmpeg, FFprobe, and drag-and-drop support. Python is not required. Keep the extracted files together. `Check Installation.bat` performs a read-only dependency check.
+Povolení systémového `pythonw.exe` není pro samostatnou aplikaci potřeba. Windows rozlišuje cestu aplikace, takže složku s programem a nástroji po povolení ponech na stejném místě. `ffprobe.exe` slouží ke čtení a kontrole videí.
 
-## Basic use
+## Ovládání
 
-1. Choose a source folder or add files directly.
-2. Choose a different destination folder.
-3. Leave **Percentage of original bitrate** selected and set the desired percentage.
-4. Pick an encoder. The default CPU encoder works without a specific GPU; supported hardware encoders are faster.
-5. Review audio settings, then choose **Scan Folder** and **Start Encode**.
+- Rozlišení a FPS jsou na hlavní stránce; výchozí je **Jako zdroj**. Rozlišení SD/HD/Full HD/2K (QHD, 1440p)/4K slouží jako horní limit a menší zdroje se automaticky nezvětšují.
+- **Použít na zbývající videa** přenese aktuální nastavení na čekající videa. Rozpracované a dokončené video zachová své nastavení. Při této změně se použijí nové volné názvy, aby nedošlo k nechtěnému přepsání.
+- **Skrýt nastavení** uvolní většinu okna pro seznam. Nastavení má vlastní posuvník. Tabulka má vlastní vodorovné i svislé posouvání.
+- Malé tlačítko vedle přepínání jazyka mění rozložení mezi nastavením nahoře a nastavením vlevo. Videa i ovládání zůstávají spolu. V režimu vedle sebe jde měnit dělení tažením čáry. Rozložení, poloha dělení a vlastní rozměry každého režimu se pamatují mezi spuštěními. Výchozí rozměry jsou 1180×1120 px pro svislé a 1880×900 px pro boční rozložení, vždy omezené obrazovkou.
+- Při tažení dělicí čáry se pohybuje náhled; ovládací prvky se přeskládají jednou po puštění myši. Nedochází k úplnému překreslování obou panelů při každém posunu o pixel.
+- Kliknutí na záhlaví seřadí tabulku; opakování obrátí směr. Jde o pořadí zobrazení. Odebírání funguje pravým klikem nebo klávesou Delete a nesmaže soubory z disku. Během převodu/načítání je odebrání vypnuté.
+- **Web Optimized** zapisuje hlavičku MP4/MOV na začátek souboru. **Passthru Common Metadata** přebírá metadata a kapitoly ze zdroje.
+- Automatický kontejner zachovává MP4, MOV, M4V nebo MKV; u ostatních zdrojových kontejnerů použije MKV.
 
-The original videos are not edited. Completed results are written to the destination through temporary `.vbc-part` files and moved into place only after FFmpeg finishes. The app blocks any destination path that resolves to a source file.
+## Spolehlivost výstupu
 
-## Audio normalization
+Automatický GOP nastavuje interval podle výstupních FPS a vynucuje klíčový snímek po 2 sekundách. U NVENC se vynucují IDR snímky. Ruční GOP je počet snímků.
 
-Open **Audio Options** and select either the precise two-pass or faster one-pass EBU R128 mode. The default target is `-14 LUFS`, with adjustable true peak and loudness range. Normalization requires re-encoding the selected audio tracks.
+Před označením dokončeného překódovaného videa aplikace kontroluje délku, počet zvukových stop, klíčové snímky na začátku delšího videa a skutečné přeskočení doprostřed s dekódováním snímku. Tato kontrola není úplné dekódování celého souboru. Nevyhovující výstup nenahradí existující finální soubor.
 
-## Source setup
+Video prochází pamětí; aplikace nevytváří mezilehlé rozbalené snímky ani nekomprimovaná videa. Komprimovaný výstup se nejdříve zapisuje pod unikátním dočasným názvem ve výstupní složce, zkontroluje a atomicky přejmenuje. Přejmenování nevyžaduje druhou kopii videa. Malý JSON projekt ukládá nastavení a stav pro obnovení dávky; neobsahuje obrazová data. Správa stránkovací paměti zůstává systému Windows.
 
-Python 3.10+ with Tkinter is recommended. Install the one Python dependency with:
+## GPU a profily
 
-```powershell
-py -3 -m pip install -r requirements.txt
-py -3 video_compressor.py
-```
+NVENC enkóduje na NVIDIA GPU. Bez obrazových filtrů podporovaný vstup zůstává při CUDA dekódování ve VRAM. Filtry, které vyžadují CPU, potřebují přenos snímků do RAM. Zvuk a normalizace se zpracovávají na CPU.
 
-Place `ffmpeg.exe` and `ffprobe.exe` next to the script or add both to `PATH`. The release ZIP already includes them.
+Doostření má výchozí sílu 0 (vypnuto). Po zvýšení síly se ve výchozím nastavení použije `unsharp` na CPU, který byl při měření rychlejší. Volitelné GPU doostření používá `unsharp_opencl`, pokud funkční GPU a FFmpeg tento filtr podporují. Plná sestava FFmpeg v `tools` byla ověřena s RTX 3070 včetně 10bit výstupu. Posuvník ovládá skutečnou sílu doostření. Pokud OpenCL není dostupné, použije se CPU. GPU doostření může snížit práci CPU a přitom být celkově pomalejší kvůli přenosům a inicializaci. Dříve uložený projekt zachová svou výslovně uloženou volbu.
 
-To create the portable Windows build, install `requirements-build.txt`, keep FFmpeg and FFprobe beside the source, and run `build_windows.bat`.
+Profily mění pokročilé parametry i rychlostní preset. **Ultra rychlý** používá NVENC p1 nebo CPU ultrafast. **Rychlý** používá p4. **Vyvážený** p5 a **Ultra kvalita** p7. Profil s interním klíčem `handbrake` se nyní jmenuje Rychlý; nepředstírá shodu s aktuálními presety jiné aplikace. Změny profilu zachovávají zvolený režim bitrate, rozlišení a FPS.
 
-## Notes
+## Ověření a měření
 
-- Actual file-size reduction varies with container overhead, audio settings, codec efficiency, and source complexity.
-- Hardware encoding depends on compatible drivers and hardware. Use `libx265` or `libx264` CPU encoding when hardware initialization is unavailable.
-- Expert FFmpeg arguments are intentionally powerful; invalid options can make an encode fail, but the source file remains untouched.
+- `python -m unittest test_regressions -v` provádí skutečné převody, kontroly NVENC/OpenCL (pokud jsou dostupné), I-snímků, přeskakování, zvuku, projektů, velikostí a UI.
+- `python benchmark_profiles.py` měří čtyři profily na stejném syntetickém 8s videu 1280×720/60 FPS při cíli 4 Mb/s.
+- `python benchmark_gpu_options.py` porovnává při stejném p5 prostorové/časové AQ a doostření; uvádí medián ze tří převodů, čas CPU procesu FFmpeg a časy klíčových snímků.
+- Výsledky jsou v `benchmark-results/results.json` a `benchmark-results/gpu-options.json`. Krátký syntetický test neurčuje kvalitu ani rychlost každého skutečného videa.
 
-## License and credits
+## Přibalené nástroje
 
-The application source is licensed under the [MIT License](LICENSE). The Windows release includes separate third-party components under their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-Created by **FajkPes** with assistance from **ChatGPT Codex** and **Claude Code**.
+Plná sestava FFmpeg 8.1.2 pochází z https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-full_build.7z a byla ověřena SHA-256 `0fff188997a499b5382e0f66e845d4556c48c54f0113ebed4853d556dbdd7059`. Licence je v `tools/LICENSE`. Zdrojový kód FFmpeg: https://github.com/FFmpeg/FFmpeg (větev release/8.1). Původní essentials nástroje v kořenové složce zůstaly zachované jako záloha; aplikace upřednostňuje `tools`.

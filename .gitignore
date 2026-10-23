@@ -1,9 +1,10 @@
+/build/
+/dist/
+/qa-output/
+/benchmark-results/
+/bak/
+/.claude/
 __pycache__/
-build/
-dist/
-*.spec
+*.pyc
+*.exe
 vbc_settings.json
-*.vbc-part.*
-release/
-ffmpeg.exe
-ffprobe.exe

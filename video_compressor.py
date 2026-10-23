@@ -18,21 +18,27 @@ import shutil
 import subprocess
 import threading
 import time
+import math
+import tempfile
+from project_state import atomic_json, fingerprint, settings_key, is_complete, read_project
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "Video Bitrate Compressor"
-APP_VER = "1.2.0"
+APP_VER = "1.4"
 
-HERE = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
-        else Path(__file__).resolve().parent)
-RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", HERE))
+HERE = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", HERE))
 CONFIG_PATH = HERE / "vbc_settings.json"
 
 # ------------------------------------------------------------ lokalizace ---
-LANG = "en"                      # "cs" | "en"; English is the clean-install default
+LANG = "cs"                      # "cs" | "en"
+PREFERRED_LAYOUT = "stacked"
+PREFERRED_SIDE_SASH = 0.44
+PREFERRED_LAYOUT_HEIGHTS = {"stacked": 1120, "side": 900}
+PREFERRED_LAYOUT_WIDTHS = {"stacked": 1180, "side": 1880}
 LANG_NAMES = {"cs": "Čeština", "en": "English"}
 
 # klíč -> (čeština, angličtina)
@@ -51,6 +57,10 @@ S = {
     "br_mode": ("Režim bitrate", "Bitrate mode"),
     "target_br": ("Cílový bitrate", "Avg Bitrate"),
     "target_br_pct": ("Cílový bitrate (% originálu)", "Avg Bitrate (% of source)"),
+    "pct_min_br": ("Minimum (kb/s)", "Minimum (kbps)"),
+    "pct_max_br": ("Maximum (kb/s)", "Maximum (kbps)"),
+    "pct_limits_hint": ("Prázdné = bez omezení · platí pouze pro procentní režim",
+                         "Blank = no limit · applies only to percentage mode"),
     "fixed_br": ("Pevný bitrate", "Avg Bitrate (kbps)"),
     "max_br": ("Maximální bitrate", "Max Bitrate (kbps)"),
     "rounding": ("Zaokrouhlení bitrate", "Bitrate rounding"),
@@ -99,6 +109,12 @@ S = {
     "stop": ("Zastavit", "Stop Encode"),
     "open_out": ("Otevřít výstup", "Open Destination"),
     "clear": ("Vyčistit seznam", "Clear Queue"),
+    "apply_remaining": ("Použít na zbývající videa", "Apply to remaining videos"),
+    "applied_remaining": ("Nové nastavení použito na {} čekajících videí", "New settings applied to {} queued videos"),
+    "web_optimized": ("Web Optimized (MP4)", "Web Optimized (MP4)"),
+    "pass_metadata": ("Passthru Common Metadata", "Passthru Common Metadata"),
+    "hide_settings": ("Skrýt nastavení", "Hide settings"),
+    "show_settings": ("Zobrazit nastavení", "Show settings"),
     # tabulka
     "col_src": ("Zdrojový soubor", "Source"),
     "col_res": ("Rozlišení", "Dimensions"),
@@ -113,6 +129,21 @@ S = {
                   "Strip previous tag from filename (q…, a…)"),
     "col_prog": ("Průběh", "Progress"),
     "col_state": ("Stav", "Status"),
+    "ctx_original_size": ("Původní velikost", "Original size"),
+    "ctx_output_size": ("Komprimovaná velikost", "Compressed size"),
+    "ctx_saving": ("Zmenšení", "Reduction"),
+    "ctx_increase": ("Zvětšení", "Increase"),
+    "ctx_output_missing": ("Komprimovaný soubor zatím není k dispozici",
+                           "Compressed file is not available yet"),
+    "ctx_open_original": ("Otevřít původní video", "Open original video"),
+    "ctx_open_compressed": ("Otevřít komprimované video", "Open compressed video"),
+    "ctx_open_original_folder": ("Otevřít složku s původním videem",
+                                  "Open original video folder"),
+    "ctx_open_compressed_folder": ("Otevřít složku s komprimovaným videem",
+                                   "Open compressed video folder"),
+    "ctx_remove_video": ("Odebrat video ze seznamu", "Remove video from list"),
+    "ctx_open_error": ("Soubor nebo složku se nepodařilo otevřít:\n{}",
+                        "Could not open the file or folder:\n{}"),
     # stavy
     "st_wait": ("Čeká", "Queued"),
     "st_run": ("▶ Převádím…", "▶ Encoding…"),
@@ -146,6 +177,8 @@ S = {
     "avg": ("prům.", "avg"),
     "summary": ("{} videí · {} · {} → odhad ~{}", "{} videos · {} · {} → est. ~{}"),
     "done": ("Hotovo ✓", "Finished ✓"),
+    "worker_error": ("Převodní úloha byla neočekávaně ukončena:",
+                     "The conversion worker stopped unexpectedly:"),
     "stopped_by_user": ("Zastaveno uživatelem", "Stopped by user"),
     "detecting_enc": ("● zjišťuji enkodéry…", "● detecting encoders…"),
     "hw_accel": ("● HW akcelerace: {}", "● HW acceleration: {}"),
@@ -221,7 +254,8 @@ S = {
     "adv_multipass": ("Vícenásobný průchod", "Multipass Encoding"),
     "sec_gop": ("Struktura snímků", "Frame Structure"),
     "adv_gop": ("Interval klíč. snímků", "Keyframe Interval (GOP)"),
-    "adv_gop_hint": ("0 = automaticky (podle FPS)", "0 = automatic (based on framerate)"),
+    "adv_gop_hint": ("0 = automaticky, nejvýše 2 s mezi klíčovými snímky",
+                     "0 = automatic, at most 2 s between keyframes"),
     "adv_bframes": ("B-snímky", "B-Frames"),
     "adv_bref": ("B-snímky jako reference", "B-Frame Reference Mode"),
     "adv_lookahead": ("Lookahead (snímků)", "Lookahead (frames)"),
@@ -245,6 +279,10 @@ S = {
     "adv_fps": ("Snímková frekvence", "Framerate (FPS)"),
     "adv_rotate": ("Otočení / orientace", "Rotate / Flip"),
     "adv_denoise": ("Odšumění", "Denoise"),
+    "adv_sharpen": ("Doostření (0 = vypnuto)", "Sharpen (0 = off)"),
+    "adv_sharpen_gpu": ("Doostření přes GPU (OpenCL, pokud je dostupné)", "Sharpen on GPU (OpenCL, when available)"),
+    "adv_sharpen_gpu_hint": ("Vyžaduje unsharp_opencl a funkční GPU; jinak doostřuje CPU. Sílu určuje posuvník.",
+                              "Requires unsharp_opencl and a working GPU; otherwise sharpening uses CPU. The slider controls strength."),
     "adv_deint": ("Odstranit prokládání (deinterlace)", "Deinterlace"),
     "sec_perf": ("Výkon", "Performance"),
     "adv_hwaccel": ("Hardwarové dekódování vstupu", "Hardware Decoding"),
@@ -262,6 +300,7 @@ S = {
     "aud_title": ("Pokročilé nastavení zvuku", "Audio Options"),
     "sec_acodec": ("Kodek", "Audio Codec"),
     "aud_codec": ("Kodek", "Codec"),
+    "aud_codec_main": ("Kodek (při překódování)", "Codec (when re-encoding)"),
     "aud_codec_hint": ("bitrate se nastavuje v hlavním okně",
                        "bitrate is set in the main window"),
     "aud_channels": ("Kanály", "Mixdown"),
@@ -351,15 +390,22 @@ F_MONO = ("Consolas", 9)
 # ------------------------------------------------------------ ffmpeg tools --
 def find_tool(name):
     exe = name + (".exe" if os.name == "nt" else "")
-    local = HERE / exe
-    if local.exists():
-        return str(local)
+    roots = [HERE]
+    if getattr(sys, "frozen", False) and HERE.name.lower() == "dist":
+        roots.append(HERE.parent)
+    for root in roots:
+        for local in (root / "tools" / exe, root / exe):
+            if local.exists():
+                return str(local)
     found = shutil.which(name)
     return found
 
 
 FFMPEG = find_tool("ffmpeg")
 FFPROBE = find_tool("ffprobe")
+_FILTER_SUPPORT = {}
+_FILTER_SUPPORT_LOCK = threading.Lock()
+_GPU_SHARPEN_OK = False
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
@@ -371,12 +417,46 @@ def run_hidden(cmd, **kw):
     return subprocess.run(cmd, **kw)
 
 
+def ffmpeg_has_filter(name):
+    """Cache FFmpeg filter availability (used to select optional GPU paths)."""
+    with _FILTER_SUPPORT_LOCK:
+        if name in _FILTER_SUPPORT:
+            return _FILTER_SUPPORT[name]
+    supported = False
+    if FFMPEG:
+        try:
+            result = run_hidden([FFMPEG, "-hide_banner", "-filters"], timeout=15)
+            listing = (result.stdout + result.stderr).decode("utf-8", "replace")
+            supported = result.returncode == 0 and any(
+                len(line.split()) >= 3 and line.split()[1] == name
+                for line in listing.splitlines())
+        except (OSError, subprocess.SubprocessError):
+            supported = False
+    with _FILTER_SUPPORT_LOCK:
+        _FILTER_SUPPORT[name] = supported
+    return supported
+
+
+def probe_gpu_sharpen():
+    global _GPU_SHARPEN_OK
+    if not ffmpeg_has_filter("unsharp_opencl"):
+        return
+    try:
+        result = run_hidden([FFMPEG, "-v", "error", "-init_hw_device", "opencl=sharpen:,device_type=gpu",
+                             "-filter_hw_device", "sharpen", "-f", "lavfi", "-i", "testsrc2=s=64x64:d=0.1",
+                             "-vf", "format=yuv420p,hwupload,unsharp_opencl=5:5:0.5:5:5:0,hwdownload,format=yuv420p",
+                             "-f", "null", "-"], timeout=20)
+        _GPU_SHARPEN_OK = result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        _GPU_SHARPEN_OK = False
+
+
 # ------------------------------------------------------------ drag & drop --
 # Nativní DnD zajišťuje rozšíření tkdnd (balík tkinterdnd2). Leží ve složce
 # „libs“ vedle skriptu, takže se nemusí nic instalovat a složka je přenosná.
 # Vlastní okenní procedura přes ctypes tu byla dřív, ale Python 3.14 na ní
 # tvrdě padá (callback z Windows do Pythonu v době, kdy Tcl drží uvolněný GIL).
-sys.path.insert(0, str(RESOURCE_DIR / "libs"))
+sys.path.insert(0, str(BUNDLE_ROOT / "libs"))
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
 except Exception:
@@ -387,7 +467,7 @@ except Exception:
 # --------------------------------------------------------- encoder presets --
 # key -> (label, codec, container-tag, presets, supports_10bit, kind)
 ENCODERS = {
-    "hevc_nvenc": dict(label="HEVC (H.265) · NVENC — GPU", codec="hevc_nvenc",
+    "hevc_nvenc": dict(label="HEVC · NVENC — GPU", codec="hevc_nvenc",
                        presets=["p1", "p2", "p3", "p4", "p5", "p6", "p7"], default_preset="p5",
                        ten_bit=True, hw=True),
     "h264_nvenc": dict(label="H.264 · NVENC — GPU", codec="h264_nvenc",
@@ -396,13 +476,13 @@ ENCODERS = {
     "av1_nvenc":  dict(label="AV1 · NVENC — GPU (RTX 40+)", codec="av1_nvenc",
                        presets=["p1", "p2", "p3", "p4", "p5", "p6", "p7"], default_preset="p5",
                        ten_bit=True, hw=True),
-    "hevc_qsv":   dict(label="HEVC · QuickSync — Intel GPU", codec="hevc_qsv",
+    "hevc_qsv":   dict(label="HEVC · QSV — Intel GPU", codec="hevc_qsv",
                        presets=["veryfast", "faster", "fast", "medium", "slow", "slower"],
                        default_preset="slow", ten_bit=True, hw=True),
     "hevc_amf":   dict(label="HEVC · AMF — AMD GPU", codec="hevc_amf",
                        presets=["speed", "balanced", "quality"], default_preset="quality",
                        ten_bit=True, hw=True),
-    "libx265":    dict(label="HEVC (H.265) · x265 — CPU", codec="libx265",
+    "libx265":    dict(label="HEVC · x265 — CPU", codec="libx265",
                        presets=["ultrafast", "superfast", "veryfast", "faster", "fast",
                                 "medium", "slow", "slower", "veryslow"],
                        default_preset="medium", ten_bit=True, hw=False),
@@ -465,10 +545,15 @@ SCALES = {
     "custom": ("Vlastní rozměry…", "Custom size…"),
 }
 SCALE_H = {"2160": 2160, "1440": 1440, "1080": 1080, "720": 720, "480": 480}
+QUICK_SCALES = {"orig": ("Jako zdroj", "Same as source"),
+                "2160": ("4K · 2160p", "4K · 2160p"), "1440": ("2K/QHD · 1440p", "2K/QHD · 1440p"),
+                "1080": ("Full HD · 1080p", "Full HD · 1080p"), "720": ("HD · 720p", "HD · 720p"),
+                "480": ("SD · 480p", "SD · 480p"), "custom": ("Vlastní…", "Custom…")}
 
 FPS_OPTS = {"orig": ("Původní (beze změny)", "Original (unchanged)"),
             "60": ("60", "60"), "50": ("50", "50"), "30": ("30", "30"),
             "25": ("25", "25"), "24": ("24", "24")}
+QUICK_FPS = dict(FPS_OPTS, orig=("Jako zdroj", "Same as source"))
 
 ROTATE = {
     "none":      ("Beze změny", "Unchanged"),
@@ -500,7 +585,7 @@ ADV_DEFAULTS = dict(
     spatial_aq=True,
     aq_strength=8,
     temporal_aq=True,
-    gop=0,                 # 0 = automaticky (ffmpeg default)
+    gop=0,                 # 0 = automatic 2-second GOP based on output FPS
     tune="hq",
     tune_x265="none",
     level="auto",
@@ -515,6 +600,8 @@ ADV_DEFAULTS = dict(
     fps="orig",
     rotate="none",
     denoise="none",
+    sharpen=0.0,
+    sharpen_gpu=False,
     deinterlace=False,
     threads=0,
 )
@@ -526,8 +613,8 @@ ADV_DEFAULTS = dict(
 QUALITY_PROFILES = {
     "turbo":     ("Ultra rychlý — nejrychlejší, nižší kvalita",
                   "Ultra fast — fastest, lower quality"),
-    "handbrake": ("Jako HandBrake — stejný kompromis jako výchozí HandBrake",
-                  "HandBrake-like — same trade-off as HandBrake's default"),
+    "handbrake": ("Rychlý — jednodušší zpracování a menší nároky",
+                  "Fast — simpler processing and lower demands"),
     "balanced":  ("Vyvážený — dosavadní výchozí nastavení této aplikace",
                   "Balanced — this app's existing default"),
     "ultra":     ("Ultra kvalita — nejpomalejší, nejlepší obraz",
@@ -557,7 +644,7 @@ PROFILE_ADV = {
 
 # rychlostní preset v hlavním okně podle rodiny enkodéru
 PROFILE_SPEED = {
-    "turbo":     dict(nvenc="p1", qsv="veryfast", amf="speed", x26x="veryfast"),
+    "turbo":     dict(nvenc="p1", qsv="veryfast", amf="speed", x26x="ultrafast"),
     "handbrake": dict(nvenc="p4", qsv="medium", amf="balanced", x26x="medium"),
     "balanced":  dict(nvenc="p5", qsv="slow", amf="quality", x26x="medium"),
     "ultra":     dict(nvenc="p7", qsv="slower", amf="quality", x26x="slow"),
@@ -605,7 +692,7 @@ PROC_MODES = {
 }
 
 CONTAINERS = {
-    "auto": ("Jako zdroj", "Same as source"),
+    "auto": ("Automaticky", "Automatic"),
     "mp4":  ("MP4", "MP4"),
     "mkv":  ("MKV", "MKV"),
 }
@@ -713,7 +800,7 @@ def probe(path):
     """Vrátí dict s údaji o souboru nebo vyhodí RuntimeError."""
     cmd = [FFPROBE, "-v", "quiet", "-print_format", "json",
            "-show_format", "-show_streams", str(path)]
-    r = run_hidden(cmd)
+    r = run_hidden(cmd, timeout=60)
     if r.returncode != 0 or not r.stdout:
         raise NotAVideo(L("err_probe"))
     try:
@@ -759,11 +846,18 @@ def probe(path):
             src = L("src_est")
 
     fps = 0.0
-    m = re.match(r"^(\d+)/(\d+)$", v.get("avg_frame_rate") or v.get("r_frame_rate") or "")
-    if m and int(m.group(2)):
-        fps = int(m.group(1)) / int(m.group(2))
+    for rate in (v.get("avg_frame_rate"), v.get("r_frame_rate")):
+        try:
+            parts = str(rate).split("/")
+            candidate = float(parts[0]) / (float(parts[1]) if len(parts) == 2 else 1)
+            if math.isfinite(candidate) and candidate > 0:
+                fps = candidate
+                break
+        except (ValueError, ZeroDivisionError):
+            continue
 
     return dict(
+        video_stream_index=int(v["index"]),
         width=int(v.get("width") or 0),
         height=int(v.get("height") or 0),
         codec=v.get("codec_name") or "?",
@@ -910,14 +1004,22 @@ class FlowFrame(tk.Frame):
         self._items = []
         self._hgap, self._vgap = hgap, vgap
         self._lastw = -1
+        self._positions = {}
+        self._layout_height = None
+        self._relayout_id = None
         self.bind("<Configure>", lambda e: self._layout(e.width))
 
     def add(self, widget, gap=None):
         self._items.append((widget, self._hgap if gap is None else gap))
-        self.after_idle(self._relayout)
+        self._relayout()
         return widget
 
     def _relayout(self):
+        if self._relayout_id is None:
+            self._relayout_id = self.after_idle(self._run_relayout)
+
+    def _run_relayout(self):
+        self._relayout_id = None
         self._lastw = -1
         self._layout(self.winfo_width())
 
@@ -930,10 +1032,40 @@ class FlowFrame(tk.Frame):
             ww, wh = widget.winfo_reqwidth(), widget.winfo_reqheight()
             if x and x + ww > width:
                 x, y, rowh = 0, y + rowh + self._vgap, 0
-            widget.place(x=x, y=y)
+            if self._positions.get(widget) != (x, y):
+                widget.place(x=x, y=y)
+                self._positions[widget] = (x, y)
             x += ww + gap
             rowh = max(rowh, wh)
-        self.configure(height=y + rowh)
+        if self._layout_height != y + rowh:
+            self._layout_height = y + rowh
+            self.configure(height=self._layout_height)
+
+
+class DeferredPanedWindow(tk.PanedWindow):
+    """Move a lightweight sash proxy; resize the expensive contents on release."""
+
+    def __init__(self, master):
+        super().__init__(master, orient="horizontal", opaqueresize=False,
+                         bg=C["border"], bd=0, sashwidth=6, sashpad=2,
+                         sashrelief="flat", sashcursor="sb_h_double_arrow",
+                         showhandle=False, proxybackground=C["accent"],
+                         proxyborderwidth=0, proxyrelief="flat")
+
+    def add(self, child, weight=1, **kwargs):
+        kwargs.setdefault("stretch", "always" if weight else "never")
+        kwargs.setdefault("minsize", 280)
+        return super().add(child, **kwargs)
+
+    def insert(self, index, child, weight=1):
+        panes = self.panes()
+        options = {"before": panes[index]} if index < len(panes) else {}
+        return self.add(child, weight=weight, **options)
+
+    def sashpos(self, index, position=None):
+        if position is not None:
+            self.sash_place(index, int(position), 0)
+        return self.sash_coord(index)[0]
 
 
 class FlatButton(tk.Frame):
@@ -1249,6 +1381,9 @@ class AdvancedDialog(tk.Toplevel):
         self._combo(b, L("adv_fps"), "fps", loc(FPS_OPTS))
         self._combo(b, L("adv_rotate"), "rotate", loc(ROTATE))
         self._combo(b, L("adv_denoise"), "denoise", loc(DENOISE))
+        self._slider(b, L("adv_sharpen"), "sharpen", 0, 2.0, "{:.1f}", step=0.1)
+        self._check(b, L("adv_sharpen_gpu"), "sharpen_gpu")
+        self._hint(b, L("adv_sharpen_gpu_hint"))
         self._check(b, L("adv_deint"), "deinterlace")
 
         # --- výkon ---
@@ -1420,8 +1555,9 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         # okno nikdy nesmí přerůst obrazovku — spodní panel s průběhem
         # se jinak schová pod hranu a je vidět, až když se okno roztáhne
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w = min(1180, sw - 60)
-        h = min(900, sh - 90)
+        w = min(PREFERRED_LAYOUT_WIDTHS[PREFERRED_LAYOUT], sw - 60)
+        h = min(PREFERRED_LAYOUT_HEIGHTS[PREFERRED_LAYOUT], sh - 80)
+        self._initial_height = h
         self.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
         # pod ~780 px na výšku už nezbývá místo na seznam souborů
         self.minsize(min(1000, w), min(780, h))
@@ -1434,14 +1570,23 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         self.cur_proc = None
         self.encoder_ok = {}        # key -> bool | None (None = netestováno)
         self.running = False
+        self.scanning = False
         self.adv = dict(ADV_DEFAULTS)
         self.adv_a = dict(ADV_A_DEFAULTS)
         self.acodec_ok = {}
+        self.project_path = None
+        self.project_settings = None
+        self.project_lock = threading.Lock()
+        self.job_lock = threading.RLock()
+        self.layout_mode = PREFERRED_LAYOUT
+        self.side_sash = PREFERRED_SIDE_SASH
+        self.layout_heights = dict(PREFERRED_LAYOUT_HEIGHTS)
+        self.layout_widths = dict(PREFERRED_LAYOUT_WIDTHS)
 
         self._init_style()
         self._build()
         self._load_settings()
-        self.after(80, self._pump)
+        self._pump_id = self.after(80, self._pump)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if not FFMPEG or not FFPROBE:
@@ -1491,34 +1636,174 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
     def _set_language(self, code):
         """Přepne jazyk a znovu postaví celé UI (hodnoty se zachovají)."""
         global LANG
-        if code == LANG or self.running:
+        if code == LANG or self.running or self.scanning:
             return
-        self._save_settings()
+        saved = self._settings_data()
         LANG = code
         self.root_frame.destroy()
         self._build()
-        self._load_settings()
+        self._load_settings(saved)
+        self._save_settings()
+        if self.project_path:
+            self.project_label.configure(text=self.project_path.name)
         if self.encoder_ok:
             self._apply_encoder_availability()
         rows, self.files = self.files, []      # _add_row si je vloží zpět
         for info in rows:
             self._add_row(info)
+        if self._sort_column:
+            self._sort_tree(self._sort_column, self._sort_reverse)
         self._update_summary()
 
     # -------------------------------------------------------------- layout --
     def _build(self):
         root = self.root_frame = tk.Frame(self, bg=C["bg"])
         root.pack(fill="both", expand=True, padx=14, pady=12)
-
-        self._build_header(root)
-        self._build_paths(root)
-        self._build_settings(root)
-        self._build_actions(root)
-        # panel s průběhem se pakuje odspodu ještě před tabulkou — má tak
-        # své místo jisté a při nedostatku výšky se zmenšuje jen tabulka
-        self._build_progress(root)
-        self._build_table(root)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1, minsize=180)
+        root.rowconfigure(3, weight=1, minsize=120)
+        header = tk.Frame(root, bg=C["bg"])
+        header.grid(row=0, column=0, sticky="ew")
+        self._build_header(header)
+        settings = self.settings_panel = tk.Frame(root, bg=C["bg"])
+        self._settings_hidden = False
+        settings.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        canvas = tk.Canvas(settings, bg=C["bg"], highlightthickness=0, height=500)
+        scrollbar = ttk.Scrollbar(settings, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        settings_body = tk.Frame(canvas, bg=C["bg"])
+        window = canvas.create_window(0, 0, window=settings_body, anchor="nw")
+        last_region = [None]
+        def sync_scroll_region(_event=None):
+            region = canvas.bbox("all")
+            if region != last_region[0]:
+                canvas.configure(scrollregion=region)
+                last_region[0] = region
+        settings_body.bind("<Configure>", sync_scroll_region)
+        pending_width = [None]
+        width_timer = [None]
+        def apply_settings_width():
+            width_timer[0] = None
+            if canvas.winfo_exists():
+                canvas.itemconfigure(window, width=pending_width[0])
+        def schedule_settings_width(event):
+            if event.width == pending_width[0]:
+                return
+            pending_width[0] = event.width
+            if width_timer[0] is None:
+                width_timer[0] = canvas.after_idle(apply_settings_width)
+        canvas.bind("<Configure>", schedule_settings_width)
+        self._build_paths(settings_body)
+        self._build_settings(settings_body)
+        actions = tk.Frame(root, bg=C["bg"])
+        actions.grid(row=2, column=0, sticky="ew")
+        self._build_actions(actions)
+        table = tk.Frame(root, bg=C["bg"])
+        table.grid(row=3, column=0, sticky="nsew")
+        self._build_table(table)
+        progress = tk.Frame(root, bg=C["bg"])
+        progress.grid(row=4, column=0, sticky="ew")
+        self._build_progress(progress)
+        self._layout_sections = settings, actions, table, progress
+        self.layout_pane = DeferredPanedWindow(root)
+        self.settings_holder = tk.Frame(self.layout_pane, bg=C["bg"])
+        self.queue_holder = tk.Frame(self.layout_pane, bg=C["bg"])
+        self.settings_holder.columnconfigure(0, weight=1)
+        self.settings_holder.rowconfigure(0, weight=1)
+        self.queue_holder.columnconfigure(0, weight=1)
+        self.queue_holder.rowconfigure(1, weight=1)
+        self.layout_pane.add(self.settings_holder, weight=0)
+        self.layout_pane.add(self.queue_holder, weight=1)
+        self.layout_pane.bind("<ButtonRelease-1>", lambda _e: self.after_idle(self._remember_sash))
+        if self.layout_mode == "side":
+            self._apply_layout()
+        def wheel(event):
+            if not isinstance(event.widget, (ttk.Combobox, ttk.Scale)):
+                canvas.yview_scroll(-int(event.delta / 120), "units")
+                return "break"
+        def bind_wheel(widget):
+            widget.bind("<MouseWheel>", wheel, add="+")
+            for child in widget.winfo_children():
+                bind_wheel(child)
+        bind_wheel(settings)
         self._register_dnd(self)
+
+    def _remember_sash(self):
+        if self.layout_mode == "side" and not self._settings_hidden and self.layout_pane.winfo_width() > 10:
+            self.side_sash = max(0.25, min(.7, self.layout_pane.sashpos(0) / self.layout_pane.winfo_width()))
+            self._save_settings()
+
+    def _toggle_layout(self):
+        if self.winfo_height() > 1:
+            self.layout_heights[self.layout_mode] = self.winfo_height()
+            self.layout_widths[self.layout_mode] = self.winfo_width()
+        if self.layout_mode == "side":
+            self._remember_sash()
+            self.layout_mode = "stacked"
+        else:
+            self.layout_mode = "side"
+        if self._settings_hidden:
+            self._toggle_settings_panel()
+        self._apply_layout()
+        self._save_settings()
+
+    def _apply_layout(self):
+        settings, actions, table, progress = self._layout_sections
+        for section in self._layout_sections:
+            section.grid_forget()
+        height = min(self.layout_heights[self.layout_mode], self.winfo_screenheight() - 80)
+        if self.layout_mode == "side":
+            width = min(self.layout_widths["side"], self.winfo_screenwidth() - 60)
+            self.geometry(f"{width}x{height}+{max(0, (self.winfo_screenwidth()-width)//2)}+{max(0,self.winfo_y())}")
+            for row in (2, 3, 4):
+                self.root_frame.rowconfigure(row, minsize=0, weight=0)
+            self.root_frame.rowconfigure(1, minsize=0, weight=1)
+            self.layout_pane.grid(row=1, column=0, rowspan=4, sticky="nsew")
+            settings.grid(in_=self.settings_holder, row=0, column=0, sticky="nsew", padx=(0, 10))
+            actions.grid(in_=self.queue_holder, row=0, column=0, sticky="ew")
+            table.grid(in_=self.queue_holder, row=1, column=0, sticky="nsew")
+            progress.grid(in_=self.queue_holder, row=2, column=0, sticky="ew")
+            self.btn_layout.set_text("▤")
+            self.after(50, self._restore_side_sash)
+        else:
+            self.layout_pane.grid_remove()
+            self.geometry(f"{min(self.layout_widths['stacked'], self.winfo_screenwidth() - 60)}x{height}")
+            self.root_frame.rowconfigure(1, minsize=180, weight=1)
+            self.root_frame.rowconfigure(3, minsize=120, weight=1)
+            settings.grid(in_=self.root_frame, row=1, column=0, sticky="nsew", pady=(0, 8))
+            actions.grid(in_=self.root_frame, row=2, column=0, sticky="ew")
+            table.grid(in_=self.root_frame, row=3, column=0, sticky="nsew")
+            progress.grid(in_=self.root_frame, row=4, column=0, sticky="ew")
+            self.btn_layout.set_text("▥")
+        for section in self._layout_sections:
+            section.lift()
+
+    def _restore_side_sash(self):
+        if self.layout_mode == "side" and self.layout_pane.winfo_exists():
+            width = self.layout_pane.winfo_width()
+            if width > 10:
+                self.layout_pane.sashpos(0, int(width * self.side_sash))
+
+    def _toggle_settings_panel(self):
+        if not self._settings_hidden:
+            self._settings_hidden = True
+            self.settings_panel.grid_remove()
+            if self.layout_mode == "side":
+                self.layout_pane.forget(self.settings_holder)
+            else:
+                self.root_frame.rowconfigure(1, minsize=0, weight=0)
+            self.btn_toggle_settings.set_text(L("show_settings"))
+        else:
+            self._settings_hidden = False
+            self.settings_panel.grid()
+            if self.layout_mode == "side":
+                self.layout_pane.insert(0, self.settings_holder, weight=0)
+                self.after_idle(self._restore_side_sash)
+            else:
+                self.root_frame.rowconfigure(1, minsize=180, weight=1)
+            self.btn_toggle_settings.set_text(L("hide_settings"))
 
     # header
     def _build_header(self, root):
@@ -1535,6 +1820,9 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         right.pack(side="right")
         langbar = tk.Frame(right, bg=C["bg"])
         langbar.pack(anchor="e")
+        self.btn_layout = FlatButton(langbar, "▥", self._toggle_layout, kind="ghost", width=1)
+        self.btn_layout.lbl.configure(padx=6, pady=2)
+        self.btn_layout.pack(side="left", padx=(0, 8))
         for code in ("cs", "en"):
             active = (code == LANG)
             b = tk.Label(langbar, text=LANG_NAMES[code], font=F_SMALL,
@@ -1625,9 +1913,10 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         for i in range(4):
             body.columnconfigure(i, weight=1, uniform="s")
 
-        def field(col, row, text):
-            f = tk.Frame(body, bg=C["panel"])
-            f.grid(row=row, column=col, sticky="ew", padx=(0, 12), pady=(0, 10))
+        def field(col, row, text, columnspan=1, parent=body, columns=4):
+            f = tk.Frame(parent, bg=C["panel"])
+            f.grid(row=row, column=col, columnspan=columnspan, sticky="ew",
+                   padx=(0, 0 if col + columnspan == columns else 10), pady=(0, 10))
             tk.Label(f, text=text, bg=C["panel"], fg=C["muted"], font=F_SMALL
                      ).pack(anchor="w", pady=(0, 3))
             return f
@@ -1640,7 +1929,8 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         self.mode_var.trace_add("write", lambda *_: self._on_mode_change())
 
         # --- hodnota bitrate (procenta NEBO fixní) ---
-        self.br_field = field(1, 0, L("target_br").upper())
+        # Procentní hodnota a oba limity potřebují víc místa než jeden sloupec.
+        self.br_field = field(1, 0, L("target_br").upper(), columnspan=3)
         self.br_caption = self.br_field.winfo_children()[0]
         self.br_holder = tk.Frame(self.br_field, bg=C["panel"])
         self.br_holder.pack(fill="x")
@@ -1648,13 +1938,40 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         # procenta
         self.pct_frame = tk.Frame(self.br_holder, bg=C["panel"])
         self.pct_var = tk.IntVar(value=70)
+        self.pct_min_var = tk.StringVar(value="")
+        self.pct_max_var = tk.StringVar(value="")
+        self.pct_frame.columnconfigure(0, weight=2)
+        self.pct_frame.columnconfigure(1, weight=1)
+        self.pct_frame.columnconfigure(2, weight=1)
+        pct_slider_row = tk.Frame(self.pct_frame, bg=C["panel"])
+        pct_slider_row.grid(row=0, column=0, sticky="ew", padx=(0, 18), pady=(17, 0))
         self.pct_lbl = tk.Label(self.pct_frame, text="70 %", bg=C["panel_hi"], fg=C["accent"],
                                 font=(FONT, 11, "bold"), width=6, pady=3)
-        self.pct_lbl.pack(side="right", padx=(8, 0))
+        self.pct_lbl.pack(in_=pct_slider_row, side="right", padx=(8, 0))
         self.pct_scale = ttk.Scale(self.pct_frame, from_=5, to=150, orient="horizontal",
                                    style="D.Horizontal.TScale", command=self._on_pct)
         self.pct_scale.set(70)
-        self.pct_scale.pack(side="left", fill="x", expand=True)
+        self.pct_scale.pack(in_=pct_slider_row, side="left", fill="x", expand=True)
+
+        def limit_entry(parent, label, variable, column):
+            holder = tk.Frame(parent, bg=C["panel"])
+            holder.grid(row=0, column=column, sticky="ew",
+                        padx=(0, 9) if column == 1 else (9, 0))
+            tk.Label(holder, text=label, bg=C["panel"], fg=C["muted"],
+                     font=F_SMALL).pack(anchor="w", pady=(0, 2))
+            entry = tk.Entry(holder, textvariable=variable, bg=C["panel_hi"], fg=C["text"],
+                             insertbackground=C["accent"], relief="flat", font=F_BASE,
+                             highlightthickness=1, highlightbackground=C["border"],
+                             highlightcolor=C["accent"])
+            entry.pack(fill="x", ipady=3)
+            return entry
+
+        limit_entry(self.pct_frame, L("pct_min_br"), self.pct_min_var, 1)
+        limit_entry(self.pct_frame, L("pct_max_br"), self.pct_max_var, 2)
+        tk.Label(self.pct_frame, text=L("pct_limits_hint"), bg=C["panel"], fg=C["muted"],
+                 font=F_SMALL).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.pct_min_var.trace_add("write", lambda *_: self._refresh_targets())
+        self.pct_max_var.trace_add("write", lambda *_: self._refresh_targets())
 
         # fixní
         self.fix_frame = tk.Frame(self.br_holder, bg=C["panel"])
@@ -1671,42 +1988,61 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
         self.pct_frame.pack(fill="x")
 
+        video_row = tk.Frame(body, bg=C["panel"])
+        video_row.grid(row=1, column=0, columnspan=4, sticky="ew")
+        for col, weight in enumerate((20, 8, 16, 10, 22, 12)):
+            video_row.columnconfigure(col, weight=weight, uniform="video")
+
         # --- enkodér ---
-        f = field(2, 0, L("encoder").upper())
+        f = field(0, 0, "KODEK / ENKODÉR" if LANG == "cs" else "ENCODER", parent=video_row, columns=6)
         self.enc_var = tk.StringVar()
         self.enc_cb = ttk.Combobox(f, textvariable=self.enc_var, state="readonly",
-                                   style="D.TCombobox", font=F_BASE,
+                                   style="D.TCombobox", font=F_BASE, width=1,
                                    values=[v["label"] for v in ENCODERS.values()])
-        # CPU encoding works on every supported PC; hardware encoders remain selectable.
-        self.enc_cb.set(ENCODERS["libx265"]["label"])
+        self.enc_cb.set(ENCODERS["hevc_nvenc"]["label"])
         self.enc_cb.pack(fill="x")
         self.enc_cb.bind("<<ComboboxSelected>>", self._on_encoder_change)
 
         # --- bitová hloubka ---
-        f = field(3, 0, L("depth").upper())
-        self.depth_var = tk.StringVar(value="8 bit")
+        f = field(1, 0, "BITY" if LANG == "cs" else "BIT DEPTH", parent=video_row, columns=6)
+        self.depth_var = tk.StringVar(value="10 bit")
         self.depth_cb = ttk.Combobox(f, textvariable=self.depth_var, state="readonly",
-                                     style="D.TCombobox", font=F_BASE,
+                                     style="D.TCombobox", font=F_BASE, width=1,
                                      values=["8 bit", "10 bit"])
         self.depth_cb.pack(fill="x")
 
+        f = field(2, 0, L("adv_scale").upper(), parent=video_row, columns=6)
+        self.quick_scale_var = tk.StringVar(value=loc(QUICK_SCALES)[self.adv["scale"]])
+        self.quick_scale_cb = ttk.Combobox(f, textvariable=self.quick_scale_var, width=1,
+                                          state="readonly", style="D.TCombobox", font=F_BASE,
+                                          values=list(loc(QUICK_SCALES).values()))
+        self.quick_scale_cb.pack(fill="x")
+        self.quick_scale_cb.bind("<<ComboboxSelected>>", self._on_quick_video_change)
+        f = field(3, 0, "FPS", parent=video_row, columns=6)
+        self.quick_fps_var = tk.StringVar(value=loc(QUICK_FPS)[self.adv["fps"]])
+        self.quick_fps_cb = ttk.Combobox(f, textvariable=self.quick_fps_var, width=1,
+                                        state="readonly", style="D.TCombobox", font=F_BASE,
+                                        values=list(loc(QUICK_FPS).values()))
+        self.quick_fps_cb.pack(fill="x")
+        self.quick_fps_cb.bind("<<ComboboxSelected>>", self._on_quick_video_change)
+
         # --- preset ---
-        f = field(0, 1, L("preset").upper())
+        f = field(4, 0, "PRESET", parent=video_row, columns=6)
         self.preset_var = tk.StringVar()
         self.preset_cb = ttk.Combobox(f, textvariable=self.preset_var, state="readonly",
-                                      style="D.TCombobox", font=F_BASE)
+                                      style="D.TCombobox", font=F_BASE, width=1)
         self.preset_cb.pack(fill="x")
 
         # --- kontejner ---
-        f = field(1, 1, L("container").upper())
+        f = field(5, 0, "KONTEJNER" if LANG == "cs" else "CONTAINER", parent=video_row, columns=6)
         self.cont_var = tk.StringVar(value=loc(CONTAINERS)["mp4"])
         ttk.Combobox(f, textvariable=self.cont_var, state="readonly",
-                     style="D.TCombobox", font=F_BASE,
+                     style="D.TCombobox", font=F_BASE, width=1,
                      values=list(loc(CONTAINERS).values())).pack(fill="x")
         self.cont_var.trace_add("write", lambda *_: self._refresh_targets())
 
         # --- audio ---
-        f = field(2, 1, L("audio").upper())
+        f = field(0, 2, L("audio").upper())
         arow = tk.Frame(f, bg=C["panel"])
         arow.pack(fill="x")
         self.audio_var = tk.StringVar(value=loc(AUDIO_MODES)["copy"])
@@ -1725,8 +2061,17 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         self.audio_var.trace_add("write", lambda *_: self._on_audio_change())
         self.acustom_var.trace_add("write", lambda *_: self._refresh_targets())
 
+        # Kodek zvuku je běžná volba, proto je přímo vedle režimu a bitrate.
+        f = field(1, 2, L("aud_codec_main").upper())
+        self.audio_codec_var = tk.StringVar(value=loc(AUDIO_CODECS)[self.adv_a["codec"]])
+        self.audio_codec_cb = ttk.Combobox(
+            f, textvariable=self.audio_codec_var, state="readonly",
+            style="D.TCombobox", font=F_BASE, values=list(loc(AUDIO_CODECS).values()))
+        self.audio_codec_cb.pack(fill="x")
+        self.audio_codec_cb.bind("<<ComboboxSelected>>", self._on_audio_codec_change)
+
         # --- přípona ---
-        f = field(3, 1, L("suffix").upper())
+        f = field(0, 3, L("suffix").upper())
         self.suffix_var = tk.StringVar(value="")
         tk.Entry(f, textvariable=self.suffix_var, bg=C["panel_hi"], fg=C["text"],
                  insertbackground=C["accent"], relief="flat", font=F_BASE,
@@ -1734,7 +2079,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                  highlightcolor=C["accent"]).pack(fill="x", ipady=5)
 
         # --- co překódovat ---
-        f = field(0, 2, L("proc_mode").upper())
+        f = field(2, 2, L("proc_mode").upper())
         self.proc_var = tk.StringVar(value=loc(PROC_MODES)["both"])
         ttk.Combobox(f, textvariable=self.proc_var, state="readonly",
                      style="D.TCombobox", font=F_BASE,
@@ -1742,7 +2087,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         self.proc_var.trace_add("write", lambda *_: self._on_proc_change())
 
         # --- zaokrouhlení bitrate ---
-        f = field(1, 2, L("rounding").upper())
+        f = field(3, 2, L("rounding").upper())
         self.round_var = tk.StringVar(value=loc(ROUNDING)["100"])
         ttk.Combobox(f, textvariable=self.round_var, state="readonly",
                      style="D.TCombobox", font=F_BASE,
@@ -1750,8 +2095,8 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         self.round_var.trace_add("write", lambda *_: self._refresh_targets())
 
         # --- volby (zalamují se, aby se při zúžení okna nepřekrývaly) ---
-        f = FlowFrame(body, hgap=22, vgap=8)
-        f.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(2, 0))
+        f = FlowFrame(body, hgap=18, vgap=8)
+        f.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(2, 0))
         self.skip_bigger_var = tk.BooleanVar(value=True)
         self.overwrite_var = tk.BooleanVar(value=False)
         self.qname_var = tk.BooleanVar(value=True)
@@ -1763,18 +2108,28 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         f.add(self._checkbox(f, L("overwrite"), self.overwrite_var))
         self.keep_partial_var = tk.BooleanVar(value=True)
         f.add(self._checkbox(f, L("keep_partial"), self.keep_partial_var), gap=28)
+        self.web_optimized_var = tk.BooleanVar(value=True)
+        self.pass_metadata_var = tk.BooleanVar(value=True)
+        f.add(self._checkbox(f, L("web_optimized"), self.web_optimized_var))
+        f.add(self._checkbox(f, L("pass_metadata"), self.pass_metadata_var))
 
-        f.add(FlatButton(f, L("advanced_btn"), self._open_advanced,
-                         kind="normal", icon="⚙"), gap=8)
-        f.add(FlatButton(f, L("audio_btn"), self._open_audio,
-                         kind="normal", icon="♪"), gap=12)
-        self.adv_hint = tk.Label(f, text="", bg=C["panel"], fg=C["accent"], font=F_SMALL)
-        f.add(self.adv_hint)
-        self.opt_flow = f
+        advanced_options = FlowFrame(body, hgap=8, vgap=6)
+        advanced_options.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        FlatButton(advanced_options, L("audio_btn"), self._open_audio,
+                   kind="normal", icon="♪")
+        advanced_options.add(advanced_options.winfo_children()[-1])
+        FlatButton(advanced_options, L("advanced_btn"), self._open_advanced,
+                   kind="normal", icon="⚙")
+        advanced_options.add(advanced_options.winfo_children()[-1])
+        self.adv_hint = tk.Label(advanced_options, text="", bg=C["panel"],
+                                 fg=C["accent"], font=F_SMALL)
+        advanced_options.add(self.adv_hint)
+        self.opt_flow = advanced_options
 
         self._on_encoder_change()
         self._on_mode_change()
         self._on_audio_change()
+        self._refresh_audio_codec_options()
         self._update_adv_hint()
 
     def _open_audio(self):
@@ -1782,8 +2137,28 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
     def _apply_audio(self, adv_a):
         self.adv_a = adv_a
+        self._refresh_audio_codec_options()
         self._refresh_targets()
         self._update_adv_hint()
+
+    def _on_audio_codec_change(self, _=None):
+        self.adv_a["codec"] = rev(AUDIO_CODECS, self.audio_codec_var.get(), "aac")
+        self._refresh_targets()
+        self._update_adv_hint()
+
+    def _refresh_audio_codec_options(self):
+        if not self._alive("audio_codec_cb"):
+            return
+        available = {key: label for key, label in loc(AUDIO_CODECS).items()
+                     if key == "same" or self.acodec_ok.get(key, True)}
+        if self.adv_a.get("codec") not in available:
+            self.adv_a["codec"] = "aac" if "aac" in available else "same"
+        self.audio_codec_cb.configure(values=list(available.values()))
+        self.audio_codec_var.set(available[self.adv_a["codec"]])
+        reencode = (self._audio_key() not in ("copy", "none")
+                    or (self._audio_key() == "copy"
+                        and self._audio_reencode_forced(self._audio_cfg())))
+        self.audio_codec_cb.configure(state="readonly" if reencode else "disabled")
 
     def _on_audio_change(self):
         if not self._alive("acustom_entry"):
@@ -1792,13 +2167,28 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             self.acustom_entry.pack(side="left", padx=(6, 0), ipady=4)
         else:
             self.acustom_entry.pack_forget()
+        self._refresh_audio_codec_options()
         self._refresh_targets()
 
     def _open_advanced(self):
         AdvancedDialog(self, self.adv, self._enc_key(), self._apply_advanced)
 
+    def _on_quick_video_change(self, event=None):
+        self.adv["scale"] = rev(QUICK_SCALES, self.quick_scale_var.get(), "orig")
+        self.adv["fps"] = rev(QUICK_FPS, self.quick_fps_var.get(), "orig")
+        self._refresh_targets()
+        self._update_adv_hint()
+        if event is not None and event.widget == self.quick_scale_cb and self.adv["scale"] == "custom":
+            self._open_advanced()
+
+    def _sync_quick_video(self):
+        if self._alive("quick_scale_cb"):
+            self.quick_scale_var.set(loc(QUICK_SCALES).get(self.adv["scale"], loc(QUICK_SCALES)["orig"]))
+            self.quick_fps_var.set(loc(QUICK_FPS).get(self.adv["fps"], loc(QUICK_FPS)["orig"]))
+
     def _apply_advanced(self, adv, profile=None):
         self.adv = adv
+        self._sync_quick_video()
         if profile in PROFILE_SPEED:
             # profil řídí i rychlostní preset v hlavním okně
             fam = enc_family(self._enc_key())
@@ -1807,6 +2197,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             if want in avail:
                 self.preset_var.set(self._preset_label(want))
         self._update_adv_hint()
+        self._refresh_targets()
 
     def _update_adv_hint(self):
         if not self._alive("adv_hint"):
@@ -1833,6 +2224,11 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             bits.append(loc(ROTATE)[self.adv["rotate"]])
         if self.adv["denoise"] != "none":
             bits.append(L("denoise_short"))
+        if float(self.adv.get("sharpen", 0)) > 0:
+            if self.adv.get("sharpen_gpu", False) and _GPU_SHARPEN_OK:
+                bits.append("doostření GPU" if LANG == "cs" else "GPU sharpen")
+            else:
+                bits.append("doostření CPU" if LANG == "cs" else "CPU sharpen")
         if self.adv_a["normalize"] != "off":
             bits.append(f"EBU R128 {self.adv_a['lufs']:.0f} LUFS")
         if int(self.adv_a["offset_ms"]):
@@ -1846,6 +2242,19 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
     # akční tlačítka
     def _build_actions(self, root):
+        projects = tk.Frame(root, bg=C["bg"])
+        projects.pack(fill="x", pady=(0, 6))
+        FlatButton(projects, "Uložit projekt…" if LANG == "cs" else "Save project…",
+                   self._save_project_dialog).pack(side="left", padx=(0, 8))
+        FlatButton(projects, "Otevřít projekt…" if LANG == "cs" else "Open project…",
+                   self._open_project).pack(side="left", padx=(0, 8))
+        self.btn_apply_remaining = FlatButton(projects, L("apply_remaining"),
+                                              self._apply_remaining_settings, icon="⟳")
+        self.btn_apply_remaining.pack(side="left", padx=(0, 8))
+        self.btn_toggle_settings = FlatButton(projects, L("hide_settings"), self._toggle_settings_panel, kind="ghost")
+        self.btn_toggle_settings.pack(side="right")
+        self.project_label = tk.Label(projects, text="", bg=C["bg"], fg=C["muted"], font=F_BASE)
+        self.project_label.pack(side="left")
         bar = tk.Frame(root, bg=C["bg"])
         bar.pack(fill="x", pady=(0, 8))
 
@@ -1869,8 +2278,8 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         FlatButton(bar, L("clear"), self._clear, kind="ghost",
                    icon="✕").pack(side="right", padx=(0, 8))
 
-        self.summary_lbl = tk.Label(bar, text="", bg=C["bg"], fg=C["muted"], font=F_BASE)
-        self.summary_lbl.pack(side="right", padx=16)
+        self.summary_lbl = tk.Label(root, text="", bg=C["bg"], fg=C["muted"], font=F_BASE, anchor="w")
+        self.summary_lbl.pack(fill="x", pady=(0, 5))
 
     # tabulka
     def _build_table(self, root):
@@ -1892,12 +2301,15 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             "asrc": (L("col_asrc"), 128, "w"),
             "aout": (L("col_aout"), 150, "w"),
             "out": (L("col_out"), 190, "w"),
-            "prog": (L("col_prog"), 175, "w"),
+            "prog": (L("col_prog"), 80, "e"),
             "state": (L("col_state"), 115, "w"),
         }
         for c, (t, w, a) in heads.items():
-            self.tree.heading(c, text=t)
+            self.tree.heading(c, text=t, command=lambda col=c: self._sort_tree(col))
             self.tree.column(c, width=w, anchor=a, stretch=(c == "name"))
+        self._tree_heading_labels = {c: t for c, (t, _w, _a) in heads.items()}
+        if not hasattr(self, "_sort_column"):
+            self._sort_column, self._sort_reverse = None, False
 
         self.tree.tag_configure("odd", background=C["panel"])
         self.tree.tag_configure("even", background="#1f232b")
@@ -1910,7 +2322,14 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                            style="D.Vertical.TScrollbar")
         self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
+        hsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(xscrollcommand=hsb.set)
+        hsb.pack(side="bottom", fill="x")
         self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Button-3>", self._show_video_context_menu)
+        self.tree.bind("<Shift-F10>", self._show_video_context_menu_keyboard)
+        self.tree.bind("<Menu>", self._show_video_context_menu_keyboard)
+        self.tree.bind("<Delete>", self._remove_selected_video)
 
         # nápověda „přetáhni sem“ přes prázdnou tabulku
         self.drop_hint = tk.Frame(wrap, bg=C["panel"])
@@ -1921,6 +2340,198 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         tk.Label(self.drop_hint, text=L("drop_hint2"), bg=C["panel"], fg=C["dim"],
                  font=F_SMALL).pack(pady=(2, 0))
         self._sync_drop_hint()
+
+    @staticmethod
+    def _exact_size_text(size):
+        size = int(size)
+        units = ("B", "KiB", "MiB", "GiB", "TiB")
+        value = float(size)
+        unit = units[0]
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                break
+            value /= 1024
+        return f"{size:,}".replace(",", " ") + f" B ({value:.2f} {unit})"
+
+    @staticmethod
+    def _video_size_stats(info):
+        """Return live source/output sizes and signed size change, or None for missing files."""
+        try:
+            source_size = Path(info["path"]).stat().st_size
+        except (KeyError, OSError, TypeError):
+            return None
+        output_size = None
+        if info.get("dst"):
+            try:
+                output_size = Path(info["dst"]).stat().st_size
+            except (OSError, TypeError, ValueError):
+                pass
+        delta = source_size - output_size if output_size is not None else None
+        percent = (delta / source_size * 100) if delta is not None and source_size else None
+        return source_size, output_size, delta, percent
+
+    def _show_video_context_menu(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return "break"
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self._post_video_context_menu(iid, event.x_root, event.y_root)
+        return "break"
+
+    def _show_video_context_menu_keyboard(self, _event=None):
+        selection = self.tree.selection()
+        if not selection:
+            return "break"
+        iid = selection[0]
+        box = self.tree.bbox(iid)
+        if box:
+            x = self.tree.winfo_rootx() + box[0] + min(box[2], 220)
+            y = self.tree.winfo_rooty() + box[1] + box[3]
+            self._post_video_context_menu(iid, x, y)
+        return "break"
+
+    def _post_video_context_menu(self, iid, x, y):
+        try:
+            info = self.files[int(iid)]
+        except (ValueError, IndexError, TypeError):
+            return
+        previous = getattr(self, "_context_menu", None)
+        if previous is not None:
+            previous.destroy()
+        menu = tk.Menu(self, tearoff=0)
+        self._context_menu = menu
+        stats = self._video_size_stats(info)
+        if stats is None:
+            menu.add_command(label=L("ctx_original_size") + ": —", state="disabled")
+        else:
+            source_size, output_size, delta, percent = stats
+            menu.add_command(label=f'{L("ctx_original_size")}: {self._exact_size_text(source_size)}',
+                             state="disabled")
+            if output_size is None:
+                menu.add_command(label=L("ctx_output_missing"), state="disabled")
+            else:
+                menu.add_command(label=f'{L("ctx_output_size")}: {self._exact_size_text(output_size)}',
+                                 state="disabled")
+                title = L("ctx_saving") if delta >= 0 else L("ctx_increase")
+                percent_text = f"{abs(percent):.2f} %" if percent is not None else "—"
+                menu.add_command(label=f"{title}: {self._exact_size_text(abs(delta))} ({percent_text})",
+                                 state="disabled")
+        menu.add_separator()
+        source = Path(info["path"]) if info.get("path") else None
+        dest = Path(info["dst"]) if info.get("dst") else None
+        source_ok = bool(source and source.is_file())
+        dest_ok = bool(dest and dest.is_file())
+        menu.add_command(label=L("ctx_open_original"),
+                         state="normal" if source_ok else "disabled",
+                         command=lambda p=source: self._open_context_path(p))
+        menu.add_command(label=L("ctx_open_compressed"),
+                         state="normal" if dest_ok else "disabled",
+                         command=lambda p=dest: self._open_context_path(p))
+        menu.add_separator()
+        menu.add_command(label=L("ctx_open_original_folder"),
+                         state="normal" if source and source.parent.is_dir() else "disabled",
+                         command=lambda p=source.parent if source else None: self._open_context_path(p))
+        menu.add_command(label=L("ctx_open_compressed_folder"),
+                         state="normal" if dest and dest.parent.is_dir() else "disabled",
+                         command=lambda p=dest.parent if dest else None: self._open_context_path(p))
+        menu.add_separator()
+        menu.add_command(label=L("ctx_remove_video"),
+                         state="disabled" if self.running or self.scanning else "normal",
+                         command=lambda row=iid: self._remove_video_row(row))
+        menu.tk_popup(x, y)
+
+    def _remove_video_row(self, iid):
+        """Remove a queue item only; never delete the source or encoded file."""
+        if self.running or self.scanning:
+            return
+        try:
+            index = int(iid)
+            if index < 0 or index >= len(self.files):
+                return
+        except (ValueError, IndexError, TypeError):
+            return
+        rows = [(int(row), self.tree.item(row)) for row in self.tree.get_children() if row != iid]
+        self.files.pop(index)
+        self.tree.delete(*self.tree.get_children())
+        for old_index, item in rows:
+            new_index = old_index - (old_index > index)
+            self.tree.insert("", "end", iid=str(new_index), values=item["values"], tags=item["tags"])
+        if self._sort_column:
+            self._sort_tree(self._sort_column, self._sort_reverse)
+        self._update_summary()
+        self._sync_drop_hint()
+        remaining = self.tree.get_children()
+        if remaining:
+            self.tree.selection_set(remaining[min(index, len(remaining) - 1)])
+            self.tree.focus(self.tree.selection()[0])
+        else:
+            self.cur_name.configure(text=L("ready"))
+            self.cur_stats.configure(text="")
+            self.bar_file.set(0, "")
+            self.bar_total.set(0)
+        try:
+            self._write_project()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+
+    def _remove_selected_video(self, _event=None):
+        selected = self.tree.selection()
+        if selected:
+            self._remove_video_row(selected[0])
+        return "break"
+
+    def _sort_tree(self, column, reverse=None):
+        """Sort visible queue rows by a clicked heading, keeping item IDs stable."""
+        if reverse is None:
+            reverse = not self._sort_reverse if self._sort_column == column else False
+        self._sort_column, self._sort_reverse = column, reverse
+        for col, label in self._tree_heading_labels.items():
+            suffix = (" ▼" if reverse else " ▲") if col == column else ""
+            self.tree.heading(col, text=label + suffix)
+
+        def key(iid):
+            try:
+                info = self.files[int(iid)]
+            except (ValueError, IndexError):
+                info = {}
+            if column == "name":
+                return str(info.get("rel", "")).casefold()
+            if column == "res":
+                return (int(info.get("width") or 0), int(info.get("height") or 0))
+            if column == "dur":
+                return float(info.get("duration") or 0)
+            if column == "obr":
+                return float(info.get("vbitrate") or 0)
+            if column == "tbr":
+                return float(self._target_br(info)) if not info.get("error") else 0.0
+            if column == "prog":
+                return float(info.get("progress") or 0)
+            return str(self.tree.set(iid, column)).casefold()
+
+        rows = sorted(self.tree.get_children(""), key=key, reverse=reverse)
+        self._sort_generation = getattr(self, "_sort_generation", 0) + 1
+        generation, tree = self._sort_generation, self.tree
+        def move_batch(offset=0):
+            if generation != self._sort_generation or tree != self.tree or not tree.winfo_exists():
+                return
+            for position in range(offset, min(offset + 100, len(rows))):
+                iid = rows[position]
+                if tree.exists(iid):
+                    tree.move(iid, "", position)
+                    tags = tuple(t for t in tree.item(iid, "tags") if t not in ("odd", "even"))
+                    tree.item(iid, tags=("even" if position % 2 else "odd",) + tags)
+            if offset + 100 < len(rows):
+                self.after(1, lambda: move_batch(offset + 100))
+        move_batch()
+
+    def _open_context_path(self, path):
+        if not path:
+            return
+        try:
+            os.startfile(str(path))
+        except (OSError, AttributeError) as exc:
+            messagebox.showerror(APP_NAME, L("ctx_open_error").format(exc))
 
     # spodní progress
     def _build_progress(self, root):
@@ -2004,14 +2615,15 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
     def _open_out(self):
         p = self.out_var.get()
         if p and os.path.isdir(p):
-            os.startfile(p)
+            self._open_context_path(p)
         else:
             messagebox.showinfo(APP_NAME, L("no_out_dir"))
 
     def _clear(self):
-        if self.running:
+        if self.running or self.scanning:
             return
         self.files.clear()
+        self._sort_generation = getattr(self, "_sort_generation", 0) + 1
         self.tree.delete(*self.tree.get_children())
         self.summary_lbl.configure(text="")
         self.bar_file.set(0, "")
@@ -2019,9 +2631,14 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         self.cur_name.configure(text=L("ready"))
         self.cur_stats.configure(text="")
         self._sync_drop_hint()
+        self.project_path = None
+        self.project_settings = None
+        self.project_label.configure(text="")
 
     # -------------------------------------------------- probe dostupnosti ---
     def _probe_encoders(self):
+        # Probe in this worker thread so opening the filter list never blocks the UI.
+        probe_gpu_sharpen()
         for key, info in ENCODERS.items():
             if not info["hw"]:
                 self.encoder_ok[key] = True
@@ -2036,6 +2653,9 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             self.encoder_ok[key] = ok
 
         for key in AUDIO_CODECS:
+            if key == "same":
+                self.acodec_ok[key] = True  # policy choice, not an FFmpeg encoder
+                continue
             cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
                    "-i", "anullsrc=r=48000:cl=stereo", "-t", "0.2",
                    "-c:a", key, "-f", "null", "-"]
@@ -2059,6 +2679,8 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             self.hw_lbl.configure(text=L("hw_accel", ", ".join(hw)), fg=C["green"])
         else:
             self.hw_lbl.configure(text=L("cpu_only"), fg=C["amber"])
+        self._refresh_audio_codec_options()
+        self._update_adv_hint()
 
     def _enc_key(self):  # noqa: F811  (přepis kvůli příponě „nedostupné“)
         lbl = self.enc_var.get()
@@ -2071,7 +2693,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
     # ---------------------------------------------------------- skenování ---
     def _scan(self):
-        if self.running:
+        if self.running or self.scanning:
             return
         src = self.in_var.get().strip()
         if not src or not os.path.isdir(src):
@@ -2079,6 +2701,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             return
         self._clear()
         self._n_before_add = 0
+        self.scanning = True
         self.stop_flag.clear()      # po zrušeném převodu by sken jinak nic nenašel
         self.btn_scan.set_enabled(False)
         self.btn_add.set_enabled(False)
@@ -2087,9 +2710,18 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                   if n.strip()}
         # výstupní složku nikdy neskenujeme, i když leží uvnitř vstupní
         out = self.out_var.get().strip()
-        threading.Thread(target=self._scan_worker,
-                         args=(src, self.recurse_var.get(), ignore, out),
+        threading.Thread(target=self._run_scan,
+                         args=(self._scan_worker, src, self.recurse_var.get(), ignore, out),
                          daemon=True).start()
+
+    def _run_scan(self, worker, *args):
+        nonvideo = 0
+        try:
+            nonvideo = worker(*args) or 0
+        except Exception as exc:
+            self.msgq.put(("scan_error", str(exc)))
+        finally:
+            self.msgq.put(("scan_done", nonvideo))
 
     def _scan_worker(self, src, recurse, ignore, out):
         root = Path(src)
@@ -2115,7 +2747,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         paths = sorted(root.rglob("*") if recurse else root.glob("*"))
         vids = [p for p in paths
                 if p.is_file() and p.suffix.lower() in VIDEO_EXTS and not skipped(p)]
-        self._probe_list(vids, lambda p: p.relative_to(root))
+        return self._probe_list(vids, lambda p: p.relative_to(root))
 
     def _probe_list(self, paths, rel_fn):
         """Proběhne seznam souborů, nevidea zahodí, zbytek pošle do UI."""
@@ -2136,11 +2768,11 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             except Exception as e:
                 info = dict(path=p, rel=rel_fn(p), error=str(e),
                             width=0, height=0, duration=0,
-                            size=p.stat().st_size if p.exists() else 0,
+                            size=(fingerprint(p) or [0])[0],
                             vbitrate=0, codec="?", bsource="", fps=0, naudio=0,
                             acodec="", pix_fmt="")
             self.msgq.put(("scanned", (info, i, total)))
-        self.msgq.put(("scan_done", nonvideo))
+        return nonvideo
 
     # ------------------------------------------------------- drag & drop ---
     def _register_dnd(self, widget):
@@ -2227,6 +2859,8 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             self.drop_hint.place(relx=0.5, rely=0.5, anchor="center")
 
     def _accept_dropped(self, raw):
+        if self.scanning:
+            return
         if self.running or not self.btn_scan._enabled:
             return
         found, relmap, first_dir = [], {}, None
@@ -2269,17 +2903,18 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             self.out_var.set(str(base / "compressed"))
 
         self._n_before_add = len(self.files)
+        self.scanning = True
         self.stop_flag.clear()
         self.btn_scan.set_enabled(False)
         self.btn_add.set_enabled(False)
         self.cur_name.configure(text=L("scanning"))
-        threading.Thread(target=self._probe_list,
-                         args=(new, lambda p: relmap.get(p, Path(p.name))),
+        threading.Thread(target=self._run_scan,
+                         args=(self._probe_list, new, lambda p: relmap.get(p, Path(p.name))),
                          daemon=True).start()
 
     # ------------------------------------------------ přidání jednotlivých ---
     def _add_files(self):
-        if self.running:
+        if self.running or self.scanning:
             return
         exts = " ".join("*" + e for e in sorted(VIDEO_EXTS))
         picked = filedialog.askopenfilenames(
@@ -2311,12 +2946,13 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             self.out_var.set(str(new[0].parent / "compressed"))
 
         self._n_before_add = len(self.files)
+        self.scanning = True
         self.stop_flag.clear()      # totéž při ručním přidávání souborů
         self.btn_scan.set_enabled(False)
         self.btn_add.set_enabled(False)
         self.cur_name.configure(text=L("scanning"))
-        threading.Thread(target=self._probe_list,
-                         args=(new, lambda p: Path(p.name)), daemon=True).start()
+        threading.Thread(target=self._run_scan,
+                         args=(self._probe_list, new, lambda p: Path(p.name)), daemon=True).start()
 
     def _add_row(self, info):
         idx = len(self.files)
@@ -2339,6 +2975,16 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                     L("st_wait"))
             self.tree.insert("", "end", iid=str(idx), values=vals, tags=(tag,))
         self.tree.see(str(idx))
+        if not info.get("error") and info.get("job_state"):
+            complete = is_complete(info, info.get("job_key"))
+            info["completed"] = complete
+            label = ("✓ Hotovo" if LANG == "cs" else "✓ Completed") if complete else (
+                "Pokračovat od začátku souboru" if LANG == "cs" else "Restart this file")
+            self.tree.set(str(idx), "state", label)
+            self.tree.set(str(idx), "prog", self._bar_text(1.0 if complete else float(info.get("progress", 0))))
+            if info.get("display"):
+                for col, value in info["display"].items():
+                    self.tree.set(str(idx), col, value)
         self._sync_drop_hint()
 
     def _out_name(self, info):
@@ -2389,7 +3035,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
     def _fixed_bps(self):
         """Fixní bitrate v bit/s; 0 = neplatná hodnota."""
         txt = (self.fix_var.get() or "").strip().replace(",", ".")
-        m = re.match(r"^(\d+(?:\.\d+)?)\s*(k|m)?", txt, re.I)
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(k|m)?", txt, re.I)
         if not m:
             return 0.0
         val = float(m.group(1))
@@ -2398,8 +3044,21 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             return val * 1_000_000
         if unit == "k":
             return val * 1000
-        # bez jednotky: čísla do 10 000 ber jako kb/s, větší jako bit/s
-        return val * 1000 if val <= 10_000 else val
+        # The field is labelled kb/s: a bare number always uses that unit.
+        return val * 1000
+
+    @staticmethod
+    def _limit_bps(value):
+        """Načte volitelný limit v bit/s; holé číslo znamená kb/s."""
+        txt = re.sub(r"\s+", "", (value or "").strip().replace(",", "."))
+        if not txt:
+            return None
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(k|m)?", txt, re.I)
+        if not m:
+            return None
+        val = float(m.group(1))
+        unit = (m.group(2) or "k").lower()
+        return val * (1_000_000 if unit == "m" else 1000)
 
     def _round_key(self):
         return rev(ROUNDING, self.round_var.get(), "100")
@@ -2412,11 +3071,11 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
     @staticmethod
     def _resolve_container(container, info):
-        """„auto“ = ponechat příponu zdroje."""
+        """Keep compatible source containers; use MKV for other formats."""
         if container != "auto":
             return container
         ext = Path(info["path"]).suffix.lstrip(".").lower()
-        return ext or "mkv"
+        return ext if ext in ("mp4", "mkv", "mov", "m4v") else "mkv"
 
     def _on_proc_change(self):
         # u pouhé výměny zvuku je bezpečnější nechat původní kontejner
@@ -2432,6 +3091,8 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         mode = self._mode_key()
         if mode == "pct":
             raw = info["vbitrate"] * self.pct_var.get() / 100.0
+            lower = self._limit_bps(self.pct_min_var.get())
+            upper = self._limit_bps(self.pct_max_var.get())
         else:
             fixed = self._fixed_bps()
             if fixed <= 0:
@@ -2445,6 +3106,20 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         # zaokrouhlení nahoru nesmí přelézt originál
         if info["vbitrate"] and target > info["vbitrate"]:
             target = round_bitrate(raw, "off") if raw <= info["vbitrate"] else raw
+        if mode == "pct":
+            # Limity se aplikují až na zaokrouhlený procentní výsledek.
+            # Hodnota, která už v rozsahu je, tím zůstane nedotčená.
+            if info["vbitrate"]:
+                lower = min(lower, info["vbitrate"]) if lower is not None else None
+                upper = min(upper, info["vbitrate"]) if upper is not None else None
+            if lower is not None and upper is not None and lower > upper:
+                lower = upper
+            if lower is not None:
+                target = max(target, lower)
+            if upper is not None:
+                target = min(target, upper)
+            if info["vbitrate"]:
+                target = min(target, info["vbitrate"])
         return target
 
     def _audio_cfg(self):
@@ -2519,14 +3194,18 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         return d / (self._clean_stem(rel.stem) + suffix + tag + "." + ext)
 
     @staticmethod
-    def _unique_path(p):
-        if not p.exists():
+    def _unique_path(p, reserved=()):
+        reserved = {os.path.normcase(str(Path(q).resolve())) for q in reserved}
+        def available(candidate):
+            return not candidate.exists() and os.path.normcase(str(candidate.resolve())) not in reserved
+        if available(p):
             return p
-        for i in range(2, 1000):
+        i = 2
+        while True:
             cand = p.with_name(f"{p.stem} ({i}){p.suffix}")
-            if not cand.exists():
+            if available(cand):
                 return cand
-        return p
+            i += 1
 
     def _on_mode_change(self):
         mode = self._mode_key()
@@ -2556,12 +3235,15 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             if info.get("error"):
                 continue
             try:
-                self.tree.set(str(i), "tbr", kbps(self._target_br(info)))
-                self.tree.set(str(i), "aout", self._audio_out_text(info))
-                self.tree.set(str(i), "out", self._out_name(info))
+                frozen = info.get("display") if self.running or info.get("completed") else None
+                preview = frozen or self._preview_values(info)
+                for col, value in preview.items():
+                    self.tree.set(str(i), col, value)
             except tk.TclError:
                 pass
         self._update_summary()
+        if self._sort_column:
+            self._sort_tree(self._sort_column, self._sort_reverse)
 
     def _update_summary(self):
         if not self._alive("summary_lbl"):
@@ -2576,17 +3258,69 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         self.summary_lbl.configure(text=L("summary", len(ok), human_time(tot_dur),
                                           human_size(tot_size), human_size(est)))
 
+    def _preview_values(self, info):
+        return dict(tbr=kbps(self._target_br(info)), aout=self._audio_out_text(info), out=self._out_name(info))
+
+    def _job_config(self, collision):
+        return dict(collision=collision, enc=self._enc_key(),
+                    out_root=Path(self.out_var.get().strip()).resolve(),
+                    preset=self._preset_value(), depth=self.depth_var.get(),
+                    container=self._container_key(), audio=self._audio_key(),
+                    audio_custom=self.acustom_var.get(), proc=self._proc_key(),
+                    skip_bigger=self.skip_bigger_var.get() and self._proc_key() != "audio",
+                    keep_partial=self.keep_partial_var.get(),
+                    web_optimized=self.web_optimized_var.get(), pass_metadata=self.pass_metadata_var.get(),
+                    adv=dict(self.adv), adv_a=dict(self.adv_a))
+
+    def _apply_remaining_settings(self):
+        if self.scanning or self.stop_flag.is_set() and self.running:
+            return
+        if not self.out_var.get().strip():
+            messagebox.showwarning(APP_NAME, L("pick_output"))
+            return
+        if self._proc_key() != "audio" and self._mode_key() != "pct" and self._fixed_bps() < 50000:
+            messagebox.showwarning(APP_NAME, L("bad_fixed"))
+            return
+        settings = self._settings_data()
+        cfg = self._job_config("rename")
+        job_key = settings_key(settings)
+        try:
+            with self.job_lock:
+                pending = [f for f in self.files if not f.get("error") and not f.get("completed")
+                           and (not self.running or f.get("job_state") == "pending")]
+                reserved = [Path(f["path"]) for f in self.files]
+                reserved += [f["dst"] for f in self.files if f not in pending and f.get("dst")]
+                plans = []
+                for info in pending:
+                    dst = self._dest_path(info, cfg["out_root"], cfg["container"],
+                                          self.suffix_var.get().strip(), self._name_tag(info))
+                    dst.resolve().relative_to(cfg["out_root"])
+                    dst = self._unique_path(dst, reserved)
+                    reserved.append(dst)
+                    plans.append((info, dst, self._target_br(info), self._preview_values(info)))
+                for info, dst, target, display in plans:
+                    display["out"] = dst.name
+                    info.update(dst=dst, target=target, encode_cfg=cfg, display=display,
+                                job_key=job_key, job_settings=settings, source_stamp=fingerprint(info["path"]),
+                                resume_owned=False, completed=False, job_state="pending", progress=0.0)
+                self.project_settings = settings
+                self._write_project()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self._refresh_targets()
+        messagebox.showinfo(APP_NAME, L("applied_remaining", len(plans)))
+
     @staticmethod
     def _bar_text(frac, width=18):
-        filled = int(round(frac * width))
-        return "█" * filled + "░" * (width - filled) + f" {frac*100:5.1f} %"
+        return f"{max(0.0, min(1.0, frac))*100:.1f} %"
 
     # ------------------------------------------------------------- převod ---
     def _start(self):
-        if self.running:
+        if self.running or self.scanning:
             return
         if not FFMPEG:
-            messagebox.showerror(APP_NAME, L("no_ffmpeg"))
+            messagebox.showerror(APP_NAME, "ffmpeg.exe nenalezen.")
             return
         todo = [f for f in self.files if not f.get("error")]
         if not todo:
@@ -2612,13 +3346,16 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             if not messagebox.askyesno(
                     APP_NAME, L("enc_unavailable", ENCODERS[key]["label"])):
                 return
-        if (self._container_key() == "mp4" and self._audio_key() != "none"
+        if (any(self._resolve_container(self._container_key(), f) in ("mp4", "mov", "m4v") for f in todo)
+                and self._audio_key() != "none"
                 and self.adv_a["codec"] in AUDIO_MP4_BAD
                 and (self._audio_key() != "copy"
                      or self._audio_reencode_forced(dict(adv_a=self.adv_a)))):
             if messagebox.askyesno(
                     APP_NAME, L("mp4_audio_warn", self.adv_a["codec"])):
                 self.cont_var.set(loc(CONTAINERS)["mkv"])
+            else:
+                return
         try:
             os.makedirs(out, exist_ok=True)
         except Exception as e:
@@ -2626,15 +3363,38 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             return
 
         # cílové bitraty a cesty zmrazíme teď — vlákno nesmí sahat na Tk proměnné
-        out_root = Path(out)
+        out_root = Path(out).resolve()
         container = self._container_key()
         suffix = self.suffix_var.get().strip()
+        job_key = settings_key(self._settings_data())
         for f in self.files:
             if f.get("error"):
                 f["target"], f["dst"] = 0.0, None
                 continue
+            if is_complete(f, f.get("job_key")):
+                f["completed"] = True
+                continue
             f["target"] = self._target_br(f)
-            f["dst"] = self._dest_path(f, out_root, container, suffix, self._name_tag(f))
+            resume = (f.get("job_key") == job_key and f.get("dst")
+                      and f.get("source_stamp") == fingerprint(f["path"]))
+            if not resume:
+                f["dst"] = self._dest_path(f, out_root, container, suffix, self._name_tag(f))
+                f["job_state"] = "pending"
+                f["progress"] = 0.0
+            f["resume_owned"] = bool(resume and f.get("job_state") in ("encoding", "interrupted", "error"))
+            f["completed"] = is_complete(f, job_key)
+
+        # Several inputs can share a name (different folders/extensions/tags).
+        # Reserve completed outputs first so a later job cannot replace one.
+        reserved = [f["dst"] for f in self.files if f.get("completed") and f.get("dst")]
+        for f in self.files:
+            if not f.get("dst") or f.get("completed"):
+                continue
+            if any(os.path.normcase(str(f["dst"].resolve())) == os.path.normcase(str(Path(p).resolve()))
+                   for p in reserved):
+                f["dst"] = self._unique_path(f["dst"], reserved)
+                f["resume_owned"] = False
+            reserved.append(f["dst"])
 
         # POJISTKA: výstup nesmí nikdy ukázat na některý ze vstupních souborů
         sources = set()
@@ -2659,7 +3419,8 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
         self._save_settings()
 
-        existing = [f for f in self.files if f.get("dst") and f["dst"].exists()]
+        existing = [f for f in self.files if f.get("dst") and f["dst"].exists()
+                    and not f.get("completed") and not f.get("resume_owned")]
         if existing and not self.overwrite_var.get():
             names = [str(f["dst"].relative_to(out_root)) for f in existing]
             CollisionDialog(self, names,
@@ -2669,40 +3430,51 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
     def _begin(self, collision):
         if collision == "rename":
-            used = set()
+            used = {f["dst"] for f in self.files if f.get("dst") and (f.get("completed") or f.get("resume_owned"))}
             for f in self.files:
-                if not f.get("dst"):
+                if not f.get("dst") or f.get("completed") or f.get("resume_owned"):
                     continue
-                p = self._unique_path(f["dst"])
-                while p in used:
-                    p = self._unique_path(p.with_name(f"{p.stem} (x){p.suffix}"))
+                p = self._unique_path(f["dst"], used)
                 used.add(p)
                 f["dst"] = p
 
+        self.project_settings = self._settings_data()
+        if self.project_path is None:
+            self.project_path = self._unique_path(Path(self.out_var.get().strip()).resolve()
+                                                 / "video-compressor.vbc.json")
+        self.project_label.configure(text=self.project_path.name)
+        job_key = settings_key(self.project_settings)
+        cfg = self._job_config(collision)
+        for info in self.files:
+            if not info.get("error") and not info.get("completed"):
+                info["job_key"] = job_key
+                info["source_stamp"] = fingerprint(info["path"])
+                info["job_settings"] = self.project_settings
+                info["encode_cfg"] = cfg
+                info["job_state"] = "pending"
+                info["display"] = self._preview_values(info)
+                info["display"]["out"] = info["dst"].name
+        try:
+            self._write_project()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
         self.stop_flag.clear()
         self.pause_flag.clear()
         self.running = True
         self.btn_start.set_enabled(False)
         self.btn_scan.set_enabled(False)
+        self.btn_add.set_enabled(False)
         self.btn_pause.set_enabled(True)
         self.btn_stop.set_enabled(True)
         self.btn_pause.set_text(L("pause"), "❚❚")
 
-        cfg = dict(
-            collision=collision, enc=self._enc_key(),
-            out_root=Path(self.out_var.get().strip()).resolve(),
-            preset=self._preset_value(), depth=self.depth_var.get(),
-            container=self._container_key(), audio=self._audio_key(),
-            audio_custom=self.acustom_var.get(), proc=self._proc_key(),
-            skip_bigger=self.skip_bigger_var.get() and self._proc_key() != "audio",
-            keep_partial=self.keep_partial_var.get(),
-            adv=dict(self.adv), adv_a=dict(self.adv_a),
-        )
+        self._refresh_targets()
         self.worker = threading.Thread(target=self._convert_worker, args=(cfg,), daemon=True)
         self.worker.start()
 
     @staticmethod
-    def _video_filters(info, adv):
+    def _video_filters(info, adv, include_sharpen=True):
         """Sestaví -vf řetězec podle pokročilého nastavení."""
         vf = []
         if adv["deinterlace"]:
@@ -2712,7 +3484,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         if adv["scale"] == "custom":
             w, h = int(adv["scale_w"]), int(adv["scale_h"])
             if w > 0 and h > 0:
-                vf.append(f"scale={w}:{h}:flags=lanczos")
+                vf.append(f"scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos")
             elif w > 0:
                 vf.append(f"scale={w}:-2:flags=lanczos")
             elif h > 0:
@@ -2740,6 +3512,10 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
         if adv["denoise"] != "none":
             vf.append("hqdn3d=" + DENOISE_ARGS[adv["denoise"]])
+        sharpen = max(0.0, min(2.0, float(adv.get("sharpen", 0))))
+        if include_sharpen and sharpen > 0:
+            # FFmpeg unsharp is a software filter; GPU encoders still encode the result.
+            vf.append(f"unsharp=5:5:{sharpen:.1f}:5:5:0")
         if adv["fps"] != "orig":
             vf.append("fps=" + adv["fps"])
         return ",".join(vf)
@@ -2772,13 +3548,16 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
     def _audio_filters(self, a, measured=None, src_rate=0):
         """Filtry aplikované na jednu zvukovou stopu."""
         chain = []
+        if a["channels"] != "orig":
+            layout = {"1": "mono", "2": "stereo", "6": "5.1", "8": "7.1"}[a["channels"]]
+            chain.append(f"aformat=channel_layouts={layout}")
         off = int(a["offset_ms"])
         if off > 0:
             chain.append(f"adelay={off}:all=1")
         elif off < 0:
             chain.append(f"atrim=start={abs(off)/1000.0:.3f}")
             chain.append("asetpts=PTS-STARTPTS")
-        if a["normalize"] != "off":
+        if a["normalize"] != "off" and not (measured or {}).get("silent"):
             chain.append(self._loudnorm_filter(a, measured))
         if a["samplerate"] != "orig":
             chain.append(f"aresample={a['samplerate']}")
@@ -2788,31 +3567,50 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         return ",".join(chain)
 
     def _measure_loudness(self, path, stream_idx, a):
-        """První průchod loudnorm — vrátí naměřené hodnoty, nebo None."""
-        cmd = [FFMPEG, "-hide_banner", "-nostdin", "-i", str(path),
+        """Measure the same channel mix; a failed pass must not change modes silently."""
+        measure_options = dict(a, normalize="off", samplerate="orig", offset_ms=0)
+        prefix = self._audio_filters(measure_options)
+        measure_filter = self._loudnorm_filter(a).replace("print_format=summary", "print_format=json")
+        if prefix:
+            measure_filter = prefix + "," + measure_filter
+        cmd = [FFMPEG, "-hide_banner", "-i", str(path),
                "-map", f"0:a:{stream_idx}",
-               "-af", self._loudnorm_filter(a).replace("print_format=summary",
-                                                       "print_format=json"),
+               "-af", measure_filter,
                "-f", "null", "-"]
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW)
+        self.cur_proc = p
         try:
-            r = run_hidden(cmd, timeout=900)
-        except Exception:
-            return None
-        txt = (r.stderr or b"").decode("utf-8", "replace")
+            while True:
+                try:
+                    _, stderr = p.communicate(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self.stop_flag.is_set():
+                        self._kill(p)
+                        p.communicate()
+                        raise RuntimeError("Měření přerušeno / Measurement cancelled")
+        finally:
+            self.cur_proc = None
+        txt = (stderr or b"").decode("utf-8", "replace")
+        if p.returncode:
+            raise RuntimeError("Měření hlasitosti selhalo / Loudness measurement failed: " + txt[-1500:])
         start = txt.rfind("{")
         end = txt.rfind("}")
         if start < 0 or end < start:
-            return None
+            raise RuntimeError("Chybí měření hlasitosti / Missing loudness measurement")
         try:
             m = json.loads(txt[start:end + 1])
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise RuntimeError("Neplatné měření hlasitosti / Invalid loudness measurement") from exc
         need = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
         if not all(k in m for k in need):
-            return None
+            raise RuntimeError("Neúplné měření hlasitosti / Incomplete loudness measurement")
         # ffmpeg občas vrátí "-inf" u ticha — s tím loudnorm neumí pracovat
-        if any(str(m[k]).lstrip("-").lower().startswith("inf") for k in need):
-            return None
+        if str(m["input_i"]) == "-inf" and str(m["input_tp"]) == "-inf":
+            return {"silent": True}
+        if not all(math.isfinite(float(m[k])) for k in need):
+            raise RuntimeError("Hlasitost nelze spolehlivě změřit / Loudness cannot be measured reliably")
         return m
 
     @staticmethod
@@ -2865,31 +3663,56 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                     kb = 192                                        # rozumný default
                 args += [f"-b:a:{i}", f"{kb}k"]
 
-            chain = self._audio_filters(a, (info.get("loudness") or {}).get(i),
-                                        st.get("rate", 0))
+            # Pin the output rate per track. loudnorm may negotiate 192 kHz;
+            # Opus cannot encode 44.1 kHz, even when that is the source rate.
+            rate = int(a["samplerate"]) if a["samplerate"] != "orig" else st.get("rate", 0)
+            if codec == "libopus" and rate not in (8000, 12000, 16000, 24000, 48000):
+                rate = 48000
+            rate = rate or 48000
+            track_options = dict(a, samplerate=str(rate))
+            chain = self._audio_filters(track_options, (info.get("loudness") or {}).get(i), rate)
+            args += [f"-ar:a:{i}", str(rate)]
             if chain:
                 args += [f"-filter:a:{i}", chain]
 
         if a["channels"] != "orig":
             args += ["-ac", a["channels"]]
-        if a["samplerate"] != "orig":
-            args += ["-ar", a["samplerate"]]
         return args
 
     def _build_audio_only_cmd(self, info, dst, cfg):
         """Video se kopíruje beze ztráty, mění se pouze zvuk."""
         # bez -nostdin: přes stdin se ffmpegu posílá „q“ = korektní ukončení
         cmd = [FFMPEG, "-hide_banner", "-y", "-i", str(info["path"]),
-               "-map", "0:v:0"] + self._audio_map(cfg) + ["-map_metadata", "0"]
+               "-map", f"0:{info['video_stream_index']}" if "video_stream_index" in info else "0:V:0"] + self._audio_map(cfg)
+        cmd += self._metadata_args(cfg)
         container = self._resolve_container(cfg["container"], info)
         if container == "mkv":
             cmd += ["-map", "0:s?", "-c:s", "copy"]
         cmd += ["-c:v", "copy"]
         cmd += self._audio_args(info, cfg)
-        if container == "mp4":
+        if container in ("mp4", "mov", "m4v") and cfg.get("web_optimized", True):
             cmd += ["-movflags", "+faststart"]
         cmd += ["-progress", "pipe:1", "-nostats", "-loglevel", "error", str(dst)]
         return cmd
+
+    @staticmethod
+    def _metadata_args(cfg):
+        if cfg.get("pass_metadata", True):
+            return ["-map_metadata", "0", "-map_chapters", "0"]
+        return ["-map_metadata", "-1", "-map_metadata:s", "-1", "-map_chapters", "-1"]
+
+    @staticmethod
+    def _resolved_gop(info, adv):
+        gop = int(adv["gop"])
+        if gop > 0:
+            return gop
+        try:
+            fps = float(adv["fps"]) if adv["fps"] != "orig" else float(info.get("fps") or 0)
+        except (TypeError, ValueError):
+            fps = 0.0
+        if not math.isfinite(fps) or fps <= 0:
+            fps = 30.0
+        return max(1, int(round(fps * 2)))
 
     def _build_cmd(self, info, dst, cfg):
         if cfg.get("proc") == "audio":
@@ -2908,12 +3731,24 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         cq = adv["cq"]
         rc = adv["rc_mode"]
         ten = cfg["depth"].startswith("10") and einfo["ten_bit"]
+        sharpen = max(0.0, min(2.0, float(adv.get("sharpen", 0))))
+        use_gpu_sharpen = sharpen > 0 and adv.get("sharpen_gpu", False) and _GPU_SHARPEN_OK
+        cpu_vf = self._video_filters(info, adv, include_sharpen=False)
+        source_format = info.get("pix_fmt", "")
+        source_ten = source_format in ("yuv420p10le", "p010le")
+        cuda_frames = (family == "nvenc" and adv["hwaccel"] and not cpu_vf and not sharpen
+                       and source_format in ("yuv420p", "nv12", "yuv420p10le", "p010le")
+                       and (ten or not source_ten))
 
         cmd = [FFMPEG, "-hide_banner", "-y"]
+        if use_gpu_sharpen:
+            cmd += ["-init_hw_device", "opencl=sharpen:,device_type=gpu", "-filter_hw_device", "sharpen"]
 
         # HW dekódování vstupu (rámečky se vrací do RAM, aby fungovaly filtry)
         if adv["hwaccel"] and family == "nvenc":
             cmd += ["-hwaccel", "cuda"]
+            if cuda_frames:
+                cmd += ["-hwaccel_output_format", "cuda"]
         elif adv["hwaccel"] and family == "qsv":
             cmd += ["-hwaccel", "qsv"]
         elif adv["hwaccel"] and family in ("amf", "x26x"):
@@ -2921,11 +3756,20 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
         a_map = self._audio_map(cfg)
         container = self._resolve_container(cfg["container"], info)
-        cmd += ["-i", str(info["path"]), "-map", "0:v:0"] + a_map + ["-map_metadata", "0"]
+        cmd += ["-i", str(info["path"]), "-map",
+                f"0:{info['video_stream_index']}" if "video_stream_index" in info else "0:V:0"] + a_map
+        cmd += self._metadata_args(cfg)
         if container == "mkv":
             cmd += ["-map", "0:s?", "-c:s", "copy"]
 
-        vf = self._video_filters(info, adv)
+        vf = self._video_filters(info, adv, include_sharpen=True) if not use_gpu_sharpen else cpu_vf
+        if use_gpu_sharpen:
+            working_format = "yuv420p16le" if ten else "yuv420p"
+            gpu_chain = (f"format={working_format},hwupload,unsharp_opencl=5:5:{sharpen:.1f}:5:5:0,"
+                         f"hwdownload,format={working_format}")
+            if ten:
+                gpu_chain += ",format=p010le" if family in ("nvenc", "qsv", "amf") else ",format=yuv420p10le"
+            vf = vf + "," + gpu_chain if vf else gpu_chain
         if vf:
             cmd += ["-vf", vf]
 
@@ -2966,7 +3810,9 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                         "-tier", "high" if adv["tier_high"] else "main"]
             elif key == "h264_nvenc":
                 cmd += ["-profile:v", "high"]
-            cmd += ["-pix_fmt", "p010le" if ten else "yuv420p"]
+            cmd += ["-pix_fmt", "cuda" if cuda_frames else "p010le" if ten else "yuv420p"]
+            if cuda_frames and ten and not source_ten:
+                cmd += ["-highbitdepth", "1"]
 
         elif family == "qsv":
             cmd += ["-preset", cfg["preset"],
@@ -3005,9 +3851,14 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         if adv["level"] != "auto" and key != "libx265":
             cmd += ["-level", adv["level"]]
 
-        # ---- interval klíčových snímků ----
-        if int(adv["gop"]) > 0:
-            cmd += ["-g", str(int(adv["gop"]))]
+        # ---- interval I-snímků ----
+        # Resolve the application's automatic value explicitly for every encoder.
+        gop = self._resolved_gop(info, adv)
+        cmd += ["-g", str(gop)]
+        if int(adv["gop"]) <= 0:
+            cmd += ["-force_key_frames", "expr:gte(t,n_forced*2)"]
+            if family == "nvenc":
+                cmd += ["-forced-idr", "1"]
 
         if int(adv["threads"]) > 0:
             cmd += ["-threads", str(int(adv["threads"]))]
@@ -3018,7 +3869,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         # ---- zvuk ----
         cmd += self._audio_args(info, cfg)
 
-        if container == "mp4":
+        if container in ("mp4", "mov", "m4v") and cfg.get("web_optimized", True):
             cmd += ["-movflags", "+faststart"]
 
         if adv["extra_args"].strip():
@@ -3035,7 +3886,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
     def _discard(tmp):
         """Smaže výhradně vlastní rozpracovaný soubor — nic jiného."""
         try:
-            if ".vbc-part" in tmp.name and tmp.is_file():
+            if tmp is not None and ".vbc-part" in tmp.name and tmp.is_file():
                 tmp.unlink()
         except OSError:
             pass
@@ -3048,7 +3899,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         když v něm opravdu nějaké video je.
         """
         try:
-            if not tmp.is_file() or tmp.stat().st_size < 4096:
+            if tmp is None or not tmp.is_file() or tmp.stat().st_size < 4096:
                 return None
         except OSError:
             return None
@@ -3066,7 +3917,19 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         return target
 
     def _convert_worker(self, cfg):
-        todo = [(i, f) for i, f in enumerate(self.files) if not f.get("error")]
+        """Keep the UI lifecycle consistent if a file-level operation raises."""
+        try:
+            self._convert_worker_impl(cfg)
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            self.msgq.put(("log", f"Conversion worker failed: {detail}"))
+            self.msgq.put(("worker_error", detail))
+            self.msgq.put(("finished", dict(ok=0, skip=0, err=1,
+                                            in_bytes=0, out_bytes=0, fatal=True)))
+
+    def _convert_worker_impl(self, cfg):
+        base_cfg = cfg
+        todo = [(i, f) for i, f in enumerate(self.files) if not f.get("error") and not f.get("completed")]
         total_dur = sum(f["duration"] for _, f in todo) or 1.0
         done_dur = 0.0
         t_start = time.time()
@@ -3080,14 +3943,24 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             if self.stop_flag.is_set():
                 break
 
+            with self.job_lock:
+                cfg = info.get("encode_cfg", base_cfg)
+                self._active_cfg = cfg
+                info["job_state"] = "encoding"
+                info["progress"] = 0.0
             rel = Path(info["rel"])
-            dst = info["dst"]
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst = Path(info["dst"])
 
             # poslední pojistka: zapisovat smíme jen dovnitř výstupní složky
             try:
-                dst.resolve().relative_to(cfg["out_root"])
+                dst.resolve().relative_to(Path(cfg["out_root"]).resolve())
+                if any(dst.resolve() == Path(f["path"]).resolve()
+                       or dst.exists() and os.path.samefile(dst, f["path"])
+                       for f in self.files if Path(f["path"]).exists()):
+                    raise ValueError("Output points to a source file")
+                dst.parent.mkdir(parents=True, exist_ok=True)
             except (ValueError, OSError):
+                info["job_state"] = "error"
                 stats["err"] += 1
                 done_dur += info["duration"]
                 self.msgq.put(("row", (idx, "state", "✕ " + L("outside_out"), "err")))
@@ -3095,7 +3968,8 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                                          t_start, stats)))
                 continue
 
-            if dst.exists() and cfg["collision"] == "skip":
+            if dst.exists() and cfg["collision"] == "skip" and not info.get("resume_owned"):
+                info["job_state"] = "skipped"
                 stats["skip"] += 1
                 done_dur += info["duration"]
                 self.msgq.put(("row", (idx, "state", L("st_exists"), "skip")))
@@ -3103,17 +3977,24 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                 continue
 
             if cfg["skip_bigger"] and info["vbitrate"] and info["target"] >= info["vbitrate"]:
+                info["job_state"] = "skipped"
                 stats["skip"] += 1
                 done_dur += info["duration"]
                 self.msgq.put(("row", (idx, "state", L("st_nosmaller"), "skip")))
                 self.msgq.put(("total", (done_dur / total_dur, n, len(todo), t_start, stats)))
                 continue
 
-            self.msgq.put(("cur", (str(rel), n, len(todo))))
+            self.msgq.put(("cur", (idx, str(rel), n, len(todo))))
+            info["job_state"] = "encoding"
+            info["progress"] = 0.0
+            self._checkpoint()
+            if self.stop_flag.is_set():
+                break
 
             # dvouprůchodová EBU R128 — nejdřív změříme každou stopu
             info["loudness"] = {}
             adv_a = cfg["adv_a"]
+            measurement_error = None
             if (cfg["audio"] != "none" and adv_a["normalize"] == "r128_2pass"
                     and info.get("naudio", 0) > 0):
                 self.msgq.put(("row", (idx, "state", L("st_measuring"), "active")))
@@ -3121,27 +4002,56 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                 for si in range(ntr):
                     if self.stop_flag.is_set():
                         break
-                    m = self._measure_loudness(info["path"], si, adv_a)
+                    try:
+                        m = self._measure_loudness(info["path"], si, adv_a)
+                    except Exception as exc:
+                        measurement_error = str(exc)
+                        break
                     if m:
                         info["loudness"][si] = m
             if self.stop_flag.is_set():
                 self.msgq.put(("row", (idx, "state", L("st_cancelled"), "skip")))
+                info["job_state"] = "interrupted"
+                self._checkpoint()
                 break
+
+            if measurement_error:
+                info["job_state"] = "error"
+                stats["err"] += 1
+                done_dur += info["duration"]
+                self.msgq.put(("row", (idx, "state", "✕ " + measurement_error[:100], "err")))
+                self.msgq.put(("log", measurement_error))
+                self._checkpoint()
+                continue
 
             self.msgq.put(("row", (idx, "state", L("st_run"), "active")))
 
             # ffmpeg zapisuje do vlastního dočasného souboru; teprve hotový
             # výsledek se přesune na místo. Rozdělaný převod tak nikdy
             # nepoškodí soubor, který už ve výstupní složce je.
-            tmp = dst.with_name(dst.stem + ".vbc-part" + dst.suffix)
-            cmd = self._build_cmd(info, tmp, cfg)
-            rc, err = self._run_ffmpeg(cmd, info, idx, done_dur, total_dur, n, len(todo),
-                                       t_start, stats)
+            tmp = None
+            try:
+                descriptor, name = tempfile.mkstemp(prefix=dst.stem + ".vbc-part-", suffix=dst.suffix, dir=dst.parent)
+                os.close(descriptor)
+                tmp = Path(name)
+                cmd = self._build_cmd(info, tmp, cfg)
+                rc, err = self._run_ffmpeg(cmd, info, idx, done_dur, total_dur, n, len(todo),
+                                         t_start, stats)
+                if rc and not self.stop_flag.is_set() and re.search(r"hwaccel|cuvid|hwdownload|hwupload|opencl|cuda.*(fail|error)", err, re.I):
+                    # Retry the same encoder/quality with software decoding and
+                    # filtering if this input or driver cannot use the GPU path.
+                    fallback = dict(cfg, adv=dict(cfg["adv"], hwaccel=False, sharpen_gpu=False))
+                    self.msgq.put(("log", "GPU decode/filter retry: " + err[-1500:]))
+                    rc, err = self._run_ffmpeg(self._build_cmd(info, tmp, fallback), info, idx,
+                                               done_dur, total_dur, n, len(todo), t_start, stats)
+            except Exception as exc:
+                rc, err = -1, str(exc)
 
-            ok = rc == 0 and tmp.exists() and tmp.stat().st_size > 0
+            ok = rc == 0 and tmp is not None and tmp.exists() and tmp.stat().st_size > 0
 
             if self.stop_flag.is_set():
                 kept = self._keep_partial(tmp, dst) if cfg["keep_partial"] else None
+                info["job_state"] = "interrupted"
                 if kept:
                     try:
                         psz = kept.stat().st_size
@@ -3151,14 +4061,37 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                     stats["out_bytes"] += psz
                     self.msgq.put(("row", (idx, "state",
                                            L("st_partial", human_size(psz)), "done")))
+                elif cfg["keep_partial"]:
+                    self._discard(tmp)
+                    self.msgq.put(("row", (idx, "state", L("st_cancelled"), "skip")))
                 else:
                     self.msgq.put(("row", (idx, "state", L("st_cancelled"), "skip")))
                     self._discard(tmp)
+                self._checkpoint()
                 break
 
             if ok:
+                try:
+                    self._validate_output(tmp, info, cfg)
+                except Exception as exc:
+                    ok, err = False, str(exc)
+            if ok and cfg["skip_bigger"] and tmp.stat().st_size >= info["size"]:
+                info["job_state"] = "skipped"
+                stats["skip"] += 1
+                self._discard(tmp)
+                self.msgq.put(("row", (idx, "state", L("st_nosmaller"), "skip")))
+                done_dur += info["duration"]
+                self._checkpoint()
+                continue
+            if ok:
                 osz = tmp.stat().st_size
                 try:
+                    if cfg["collision"] == "rename" and dst.exists() and not info.get("resume_owned"):
+                        dst = self._unique_path(dst, [f["dst"] for f in self.files if f.get("dst") and f is not info])
+                        info["dst"] = dst
+                        if info.get("display"):
+                            info["display"]["out"] = dst.name
+                        self.msgq.put(("row", (idx, "out", dst.name, None)))
                     os.replace(tmp, dst)          # atomicky, jen uvnitř výstupu
                 except OSError as e:
                     ok = False
@@ -3167,6 +4100,10 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
             if ok:
                 stats["ok"] += 1
+                info["job_state"] = "done"
+                info["progress"] = 1.0
+                info["output_stamp"] = fingerprint(dst)
+                info["completed"] = True
                 stats["in_bytes"] += info["size"]
                 stats["out_bytes"] += osz
                 ratio = osz / info["size"] * 100 if info["size"] else 0
@@ -3175,16 +4112,49 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                                        f"✓ {human_size(osz)} ({ratio:.0f} %)", "done")))
             else:
                 stats["err"] += 1
+                info["job_state"] = "error"
                 msg = (err or "").strip().splitlines()
-                msg = msg[-1][:70] if msg else f"ffmpeg exit code {rc}"
+                msg = msg[-1][:70] if msg else f"ffmpeg kód {rc}"
                 self.msgq.put(("row", (idx, "state", "✕ " + msg, "err")))
                 self.msgq.put(("log", f"[{rel}] {err}"))
                 self._discard(tmp)
 
+            self._checkpoint()
             done_dur += info["duration"]
             self.msgq.put(("total", (done_dur / total_dur, n, len(todo), t_start, stats)))
 
         self.msgq.put(("finished", stats))
+
+    def _validate_output(self, path, info, cfg):
+        """Check the container and early keyframes before replacing a final output."""
+        output = probe(path)
+        if info.get("duration", 0) > 2 and output["duration"] < info["duration"] - max(1, info["duration"] * 0.02):
+            raise RuntimeError("Neúplné výstupní video / Incomplete output video")
+        expected_audio = 0 if cfg["audio"] == "none" else (
+            min(info.get("naudio", 0), 1) if cfg["adv_a"]["tracks"] == "first" else info.get("naudio", 0))
+        if output["naudio"] != expected_audio:
+            raise RuntimeError("Chybí zvuková stopa / Missing audio track")
+        if cfg.get("proc") == "audio":
+            return
+        adv = cfg["adv"]
+        fps = float(adv["fps"]) if adv["fps"] != "orig" else output["fps"]
+        interval = self._resolved_gop(info, adv) / (fps or 30)
+        if output["duration"] > interval * 2 + 0.5:
+            result = run_hidden([FFPROBE, "-v", "error", "-select_streams", "V:0",
+                                 "-read_intervals", f"%+{interval * 2 + 0.5:.3f}",
+                                 "-show_packets", "-show_entries", "packet=flags", "-of", "json", str(path)], timeout=60)
+            if result.returncode:
+                raise RuntimeError("Nelze ověřit klíčové snímky / Cannot verify keyframes")
+            packets = json.loads(result.stdout)["packets"]
+            if sum("K" in p.get("flags", "") for p in packets) < 2:
+                raise RuntimeError("Chybí pravidelné klíčové snímky / Missing periodic keyframes")
+        # Exercise seeking through the finished container's index, then decode
+        # a frame. A successful encoder exit alone does not prove this works.
+        result = run_hidden([FFMPEG, "-v", "error", "-xerror", "-ss", f"{output['duration'] * 0.5:.3f}",
+                             "-i", str(path), "-map", "0:V:0", "-frames:v", "1", "-an",
+                             "-f", "framemd5", "-"], timeout=30)
+        if result.returncode or not any(line and not line.startswith(b"#") for line in result.stdout.splitlines()):
+            raise RuntimeError("Nelze přeskakovat ve výstupním videu / Output video seek failed")
 
     def _run_ffmpeg(self, cmd, info, idx, done_dur, total_dur, n, ntot, t_start, stats):
         try:
@@ -3198,6 +4168,19 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
         self.cur_proc = p
         errbuf = []
+        process_done = threading.Event()
+
+        def watch_stop():
+            # Do not depend on progress output: a stuck decoder may emit nothing.
+            while not process_done.wait(0.2):
+                if self.stop_flag.is_set():
+                    _proc_suspend_resume(p.pid, resume=True)
+                    self._request_quit(p)
+                    if not process_done.wait(25):
+                        self._kill(p)
+                    return
+
+        threading.Thread(target=watch_stop, daemon=True).start()
 
         def drain_err():
             try:
@@ -3213,6 +4196,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
         dur = info["duration"] or 0
         last_ui = 0.0
+        last_checkpoint = 0.0
         t_file = time.time()
         cur = dict(speed="", fps="", size="", t=0.0, frame=0)
 
@@ -3260,6 +4244,10 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                 last_ui = now
 
                 frac = min(cur["t"] / dur, 1.0) if dur > 0 else 0.0
+                info["progress"] = max(0.0, frac)
+                if now - last_checkpoint >= 5.0:
+                    last_checkpoint = now
+                    self._checkpoint()
                 sp = 0.0
                 try:
                     sp = float((cur["speed"] or "0").rstrip("x"))
@@ -3285,10 +4273,12 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
                 gfrac = (done_dur + cur["t"]) / total_dur
                 self.msgq.put(("total", (gfrac, n, ntot, t_start, stats)))
-        except Exception:
-            pass
+        except Exception as exc:
+            errbuf.append(str(exc))
+            self._kill(p)
 
         p.wait()
+        process_done.set()
         if killer:
             killer.cancel()
         te.join(timeout=1)
@@ -3297,6 +4287,12 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                 p.stdin.close()
         except Exception:
             pass
+        for stream in (p.stdout, p.stderr):
+            try:
+                if stream and not stream.closed:
+                    stream.close()
+            except Exception:
+                pass
         self.cur_proc = None
         return p.returncode, "".join(errbuf)
 
@@ -3325,22 +4321,22 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         if not self.running:
             return
         if self.pause_flag.is_set():
+            if self.cur_proc and not _proc_suspend_resume(self.cur_proc.pid, resume=True):
+                return
             self.pause_flag.clear()
-            if self.cur_proc:
-                _proc_suspend_resume(self.cur_proc.pid, resume=True)
             self.btn_pause.set_text(L("pause"), "❚❚")
             self.cur_name.configure(fg=C["text"])
         else:
+            if self.cur_proc and not _proc_suspend_resume(self.cur_proc.pid, resume=False):
+                return
             self.pause_flag.set()
-            if self.cur_proc:
-                _proc_suspend_resume(self.cur_proc.pid, resume=False)
             self.btn_pause.set_text(L("resume"), "▶")
             self.cur_name.configure(fg=C["amber"])
 
     def _stop(self):
         if not self.running:
             return
-        keep = self.keep_partial_var.get()
+        keep = getattr(self, "_active_cfg", {}).get("keep_partial", self.keep_partial_var.get())
         if not messagebox.askyesno(APP_NAME,
                                    L("confirm_stop_keep") if keep else L("confirm_stop")):
             return
@@ -3359,7 +4355,11 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
     # ------------------------------------------------------- UI event pump --
     def _pump(self):
         try:
-            while True:
+            # Bound each UI tick so large scan queues do not monopolize Tk's loop.
+            tick_start = time.perf_counter()
+            for _ in range(200):
+                if time.perf_counter() - tick_start > 0.012:
+                    break
                 kind, payload = self.msgq.get_nowait()
 
                 if kind == "scanned":
@@ -3373,6 +4373,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                     self.bar_file.set(i / total, L("scan_load", i, total))
 
                 elif kind == "scan_done":
+                    self.scanning = False
                     nonvideo = payload or 0
                     self.btn_scan.set_enabled(True)
                     self.btn_add.set_enabled(True)
@@ -3389,6 +4390,11 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                     self._n_before_add = 0
                     self.cur_name.configure(text=txt)
                     self._update_summary()
+                    if self._sort_column:
+                        self._sort_tree(self._sort_column, self._sort_reverse)
+
+                elif kind == "scan_error":
+                    messagebox.showerror(APP_NAME, payload)
 
                 elif kind == "encoders":
                     self._apply_encoder_availability()
@@ -3405,11 +4411,10 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                         pass
 
                 elif kind == "cur":
-                    rel, n, tot = payload
+                    idx, rel, n, tot = payload
                     self.cur_name.configure(text=f"[{n}/{tot}]  {rel}", fg=C["text"])
                     try:
-                        self.tree.see(str(self.files.index(
-                            next(f for f in self.files if str(f["rel"]) == rel))))
+                        self.tree.see(str(idx))
                     except (StopIteration, ValueError, tk.TclError):
                         pass
 
@@ -3438,26 +4443,35 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                 elif kind == "log":
                     print(payload, file=sys.stderr)
 
+                elif kind == "project_error":
+                    messagebox.showerror(APP_NAME, payload)
+
+                elif kind == "worker_error":
+                    messagebox.showerror(APP_NAME, L("worker_error") + "\n\n" + payload)
+
                 elif kind == "finished":
                     self._on_finished(payload)
 
         except queue.Empty:
             pass
-        self._pump_id = self.after(80, self._pump)
+        self._pump_id = self.after(10 if not self.msgq.empty() else 80, self._pump)
 
     def _on_finished(self, stats):
         self.running = False
         self.btn_start.set_enabled(True)
         self.btn_scan.set_enabled(True)
+        self.btn_add.set_enabled(True)
         self.btn_pause.set_enabled(False)
         self.btn_stop.set_enabled(False)
         self.btn_pause.set_text(L("pause"), "❚❚")
         self.cur_name.configure(fg=C["text"])
         cancelled = self.stop_flag.is_set()
-        self.cur_name.configure(text=L("stopped_by_user") if cancelled else L("done"))
+        fatal = stats.get("fatal", False)
+        self.cur_name.configure(text=(L("stopped_by_user") if cancelled else
+                                       "✕ " + L("worker_error")[:-1] if fatal else L("done")))
         self.cur_stats.configure(text="")
-        self.bar_file.set(0 if cancelled else 1.0, "")
-        if not cancelled:
+        self.bar_file.set(0 if cancelled or fatal else 1.0, "")
+        if not cancelled and not fatal:
             self.bar_total.set(1.0)
             msg = "\n".join((L("res_converted", stats["ok"]),
                              L("res_skipped", stats["skip"]),
@@ -3471,15 +4485,98 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                       f"{100 - stats['out_bytes']/stats['in_bytes']*100:.1f}")))
             messagebox.showinfo(APP_NAME, msg)
 
-    # ------------------------------------------------------------ settings --
-    def _save_settings(self):
+    # ------------------------------------------------------------- projects --
+    def _write_project(self):
+        if self.project_path is None or self.project_settings is None:
+            return
+        with self.project_lock:
+            atomic_json(self.project_path, dict(
+                format="vbc-project", version=1, settings=self.project_settings,
+                files=[{k: v for k, v in f.items() if k != "loudness"} for f in self.files],
+            ))
+
+    def _checkpoint(self):
         try:
-            CONFIG_PATH.write_text(json.dumps(dict(
+            self._write_project()
+        except (OSError, ValueError) as exc:
+            # Never silently continue a job whose recovery state cannot be saved.
+            if not self.stop_flag.is_set():
+                self.stop_flag.set()
+                self.msgq.put(("project_error", "Nelze uložit projekt / Cannot save project:\n" + str(exc)))
+
+    def _save_project_dialog(self):
+        if self.running or self.scanning:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Uložit projekt" if LANG == "cs" else "Save project",
+            initialdir=self.out_var.get() or None,
+            initialfile=self.project_path.name if self.project_path else "video-compressor.vbc.json",
+            defaultextension=".vbc.json", filetypes=[("Video Bitrate Compressor", "*.vbc.json")])
+        if not path:
+            return
+        if not path.lower().endswith(".vbc.json"):
+            path += ".vbc.json"
+        previous = self.project_path, self.project_settings
+        self.project_path = Path(path).resolve()
+        self.project_settings = self._settings_data()
+        try:
+            self._write_project()
+        except (OSError, ValueError) as exc:
+            self.project_path, self.project_settings = previous
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self.project_label.configure(text=self.project_path.name)
+
+    def _open_project(self):
+        if self.running or self.scanning:
+            return
+        path = filedialog.askopenfilename(filetypes=[("Video Bitrate Compressor", "*.vbc.json")])
+        if not path:
+            return
+        try:
+            data = read_project(path)
+            self._load_settings(data["settings"])
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self._clear()
+        self.project_path = Path(path).resolve()
+        self.project_settings = data["settings"]
+        self.project_label.configure(text=self.project_path.name)
+        self.scanning = True
+        self.stop_flag.clear()
+        self.btn_scan.set_enabled(False)
+        self.btn_add.set_enabled(False)
+        threading.Thread(target=self._run_scan,
+                         args=(self._restore_project_rows, data["files"]), daemon=True).start()
+
+    def _restore_project_rows(self, rows):
+        for i, saved in enumerate(rows, 1):
+            if self.stop_flag.is_set():
+                break
+            info = dict(saved)
+            info["path"] = Path(info["path"])
+            info["rel"] = Path(info["rel"])
+            if info.get("dst"):
+                info["dst"] = Path(info["dst"])
+            if info.get("encode_cfg"):
+                info["encode_cfg"]["out_root"] = Path(info["encode_cfg"]["out_root"])
+            try:
+                info.update(probe(info["path"]), error=None)
+            except Exception as exc:
+                info["error"] = str(exc)
+            self.msgq.put(("scanned", (info, i, len(rows))))
+        return 0
+
+    # ------------------------------------------------------------ settings --
+    def _settings_data(self):
+        return dict(
                 lang=LANG,
-                # vstupní složka se schválně neukládá — po startu má být prázdná
+                **{"in": self.in_var.get()},
                 out=self.out_var.get(),
                 pct=self.pct_var.get(), mode=self._mode_key(),
                 fix=self.fix_var.get(), enc=self._enc_key(),
+                pct_min=self.pct_min_var.get(), pct_max=self.pct_max_var.get(),
                 depth=self.depth_var.get(), preset=self._preset_value(),
                 container=self._container_key(), audio=self._audio_key(),
                 rounding=self._round_key(), proc=self._proc_key(),
@@ -3487,26 +4584,34 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                 ignore=self.ignore_var.get(),
                 skip_bigger=self.skip_bigger_var.get(), qname=self.qname_var.get(),
                 keep_partial=self.keep_partial_var.get(),
+                web_optimized=self.web_optimized_var.get(), pass_metadata=self.pass_metadata_var.get(),
                 strip_tag=self.strip_tag_var.get(),
-                overwrite=self.overwrite_var.get(), adv=self.adv,
-                adv_a=self.adv_a, audio_custom=self.acustom_var.get(),
-            ), indent=2), encoding="utf-8")
+                overwrite=self.overwrite_var.get(), adv=dict(self.adv),
+                adv_a=dict(self.adv_a), audio_custom=self.acustom_var.get(),
+            )
+
+    def _save_settings(self):
+        # Appearance is global; encoding settings belong to each project.
+        try:
+            atomic_json(CONFIG_PATH, {"lang": LANG, "layout": self.layout_mode, "side_sash": self.side_sash,
+                                      "layout_heights": self.layout_heights, "layout_widths": self.layout_widths})
         except OSError:
             pass
 
-    def _load_settings(self):
-        if not CONFIG_PATH.exists():
-            return
-        try:
-            d = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return
-        self.in_var.set("")                 # vstupní složka se nepamatuje
+    def _load_settings(self, d=None):
+        if d is None:
+            d = dict(pct=60, pct_min="1000", pct_max="31000", mode="pct",
+                     enc="hevc_nvenc", depth="10 bit", preset="p5", container="auto",
+                     audio="192", proc="both", skip_bigger=False,
+                     adv=dict(ADV_DEFAULTS), adv_a=dict(ADV_A_DEFAULTS))
+        self.in_var.set(d.get("in", ""))
         self.out_var.set(d.get("out", ""))
         self.pct_var.set(int(d.get("pct", 70)))
         self.pct_scale.set(self.pct_var.get())
         self.pct_lbl.configure(text=f"{self.pct_var.get()} %")
         self.fix_var.set(d.get("fix", "4000"))
+        self.pct_min_var.set(str(d.get("pct_min", "")))
+        self.pct_max_var.set(str(d.get("pct_max", "")))
         if d.get("mode") in BR_MODES:
             self.mode_var.set(loc(BR_MODES)[d["mode"]])
         if d.get("enc") in ENCODERS:
@@ -3528,12 +4633,16 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
         self.suffix_var.set(d.get("suffix", ""))
         self.recurse_var.set(bool(d.get("recurse", False)))
         self.ignore_var.set(d.get("ignore", "compressed"))
-        self.skip_bigger_var.set(bool(d.get("skip_bigger", True)))
+        self.skip_bigger_var.set(bool(d.get("skip_bigger", False)))
         self.keep_partial_var.set(bool(d.get("keep_partial", True)))
+        self.web_optimized_var.set(bool(d.get("web_optimized", True)))
+        self.pass_metadata_var.set(bool(d.get("pass_metadata", True)))
         self.overwrite_var.set(bool(d.get("overwrite", False)))
         self.acustom_var.set(d.get("audio_custom", "128"))
         for store, defaults, saved in ((self.adv, ADV_DEFAULTS, d.get("adv")),
                                        (self.adv_a, ADV_A_DEFAULTS, d.get("adv_a"))):
+            store.clear()
+            store.update(defaults)
             for k, default in defaults.items():
                 if saved and k in saved:
                     try:
@@ -3542,6 +4651,7 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
                         store[k] = default
         self._on_audio_change()
         self._update_adv_hint()
+        self._sync_quick_video()
 
     def _on_close(self):
         if self.running:
@@ -3550,6 +4660,8 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
             self.stop_flag.set()
             if self.cur_proc:
                 self._kill(self.cur_proc)
+        self.layout_heights[self.layout_mode] = self.winfo_height()
+        self.layout_widths[self.layout_mode] = self.winfo_width()
         self._save_settings()
         try:                                   # ať Tk nehlásí visící „after“
             if getattr(self, "_pump_id", None):
@@ -3561,36 +4673,42 @@ class App(tk.Tk, *( (TkinterDnD.DnDWrapper,) if TkinterDnD else () )):
 
 def _preload_language():
     """Jazyk musí být znám dřív, než se postaví UI."""
-    global LANG
+    global LANG, PREFERRED_LAYOUT, PREFERRED_SIDE_SASH, PREFERRED_LAYOUT_HEIGHTS, PREFERRED_LAYOUT_WIDTHS
     try:
         d = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        if d.get("lang") in LANG_NAMES:
+        if isinstance(d, dict) and d.get("lang") in LANG_NAMES:
             LANG = d["lang"]
+        if isinstance(d, dict) and d.get("layout") in ("stacked", "side"):
+            PREFERRED_LAYOUT = d["layout"]
+        if isinstance(d, dict) and isinstance(d.get("side_sash"), (int, float)) and math.isfinite(d["side_sash"]):
+            PREFERRED_SIDE_SASH = max(.25, min(.7, d["side_sash"]))
+        if isinstance(d, dict) and isinstance(d.get("layout_heights"), dict):
+            for mode in PREFERRED_LAYOUT_HEIGHTS:
+                value = d["layout_heights"].get(mode)
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    PREFERRED_LAYOUT_HEIGHTS[mode] = max(600, min(1600, int(value)))
+        if isinstance(d, dict) and isinstance(d.get("layout_widths"), dict):
+            for mode in PREFERRED_LAYOUT_WIDTHS:
+                value = d["layout_widths"].get(mode)
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    PREFERRED_LAYOUT_WIDTHS[mode] = max(1000, min(3200, int(value)))
     except (OSError, ValueError):
         pass
 
 
-def _installation_check():
-    """Return a process-friendly status without opening the GUI or touching media."""
-    if not FFMPEG or not FFPROBE or TkinterDnD is None:
-        return 1
-    try:
-        for tool in (FFMPEG, FFPROBE):
-            result = run_hidden([tool, "-version"], timeout=15)
-            if result.returncode != 0:
-                return 1
-    except (OSError, subprocess.SubprocessError):
-        return 1
-    return 0
-
-
 if __name__ == "__main__":
     _preload_language()
-    if "--check" in sys.argv:
-        raise SystemExit(_installation_check())
-    if "--version" in sys.argv:
-        print(f"{APP_NAME} {APP_VER}")
-        raise SystemExit(0)
-    App().mainloop()
-
-# Created by FajkPes with assistance from ChatGPT Codex and Claude Code.
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-installation":
+        App._probe_encoders = lambda self: None
+        app = App()
+        app.withdraw()
+        app.update_idletasks()
+        atomic_json(Path(sys.argv[2]), dict(version=APP_VER, ffmpeg=FFMPEG, ffprobe=FFPROBE,
+                                           ffmpeg_ok=bool(FFMPEG and Path(FFMPEG).is_file()),
+                                           ffprobe_ok=bool(FFPROBE and Path(FFPROBE).is_file()),
+                                           dnd=app.dnd_ok, opencl=ffmpeg_has_filter("unsharp_opencl"),
+                                           scale=app.adv["scale"], fps=app.adv["fps"],
+                                           sharpen_gpu=app.adv["sharpen_gpu"]))
+        app.destroy()
+    else:
+        App().mainloop()

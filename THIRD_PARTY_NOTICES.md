@@ -4,7 +4,7 @@ The application communicates with these separate third-party programs and librar
 
 ## FFmpeg and FFprobe
 
-The portable Windows package includes FFmpeg and FFprobe 8.1.2 Essentials from Gyan.dev. This build reports `--enable-gpl --enable-version3` and is distributed under GNU GPL version 3 or later. It is not covered by the application's MIT License.
+The portable Windows package includes FFmpeg and FFprobe 8.1.2 Full from Gyan.dev. This build reports `--enable-gpl --enable-version3` and is distributed under GNU GPL version 3 or later. It is not covered by the application's MIT License.
 
 - Project: https://ffmpeg.org/
 - Windows build and corresponding source links: https://www.gyan.dev/ffmpeg/builds/
