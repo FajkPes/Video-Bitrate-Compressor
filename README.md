@@ -28,6 +28,10 @@ NVENC and GPU sharpening require supported hardware and FFmpeg capabilities. GPU
 
 [Detailed documentation](README-DETAILS.md) · [All releases](https://github.com/FajkPes/Video-Bitrate-Compressor/releases)
 
+## Audio use cases
+
+Audio processing is a separate reason to use the app: repair a quiet track with loudness normalization, change its codec or bitrate, adjust channels or sample rate, or select which audio tracks to keep. Choose audio-only processing when the image does not need another generation of compression. Choose video and audio processing when both need conversion. Not every codec is supported by every output container, and normalization necessarily re-encodes the affected audio.
+
 ## Credits
 
 **Idea, concept and design:** FajkPes  
