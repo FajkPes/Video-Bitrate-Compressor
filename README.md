@@ -23,3 +23,8 @@ Add videos, choose the bitrate percentage and profile, and start the queue. Reso
 NVENC and GPU sharpening require supported hardware and FFmpeg capabilities. GPU sharpening can be slower when transfers and initialization outweigh its benefit. Windows Controlled Folder Access may require allowing both the application and `tools/ffmpeg.exe`. The interface currently starts in Czech and can be switched to English.
 
 [Detailed documentation](README-DETAILS.md) · [All releases](https://github.com/FajkPes/Video-Bitrate-Compressor/releases)
+
+## Credits
+
+**Idea, concept and design:** FajkPes  
+**Coding:** ChatGPT Codex, Claude and Google Antigravity
